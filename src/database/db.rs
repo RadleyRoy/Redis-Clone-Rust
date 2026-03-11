@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
 
-use crate::database::data_structure::{RList, RSet};
+use crate::database::data_structure::{RList, RSet, RSortedSet};
 
 #[derive(Clone)]
 pub struct Database {
@@ -12,6 +12,7 @@ pub struct Database {
     expiry: Arc<RwLock<HashMap<String, Instant>>>,
     list: Arc<RwLock<HashMap<String, RList>>>,
     set: Arc<RwLock<HashMap<String, RSet>>>,
+    sorted_set: Arc<RwLock<HashMap<String, RSortedSet>>>,
 }
 
 impl Database {
@@ -21,6 +22,7 @@ impl Database {
             expiry: Arc::new(RwLock::new(HashMap::new())),
             list: Arc::new(RwLock::new(HashMap::new())),
             set: Arc::new(RwLock::new(HashMap::new())),
+            sorted_set: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -121,5 +123,34 @@ impl Database {
         } else {
             false
         }
+    }
+
+    pub async fn zadd(&self, key: String, member: String, score: f64) -> bool {
+        let mut sorted_set_map = self.sorted_set.write().await;
+        let sorted_set = sorted_set_map.entry(key).or_insert_with(RSortedSet::new);
+        sorted_set.zadd(score, member)
+    }
+
+    pub async fn zrem(&self, key: &str, member: &str) -> bool {
+        let mut sorted_set_map = self.sorted_set.write().await;
+        if let Some(sorted_set) = sorted_set_map.get_mut(key) {
+            sorted_set.zrem(member)
+        } else {
+            false
+        }
+    }
+
+    pub async fn zrange(&self, key: &str, start: usize, end: usize) -> Option<Vec<String>> {
+        let sorted_set_map = self.sorted_set.read().await;
+        sorted_set_map
+            .get(key)
+            .map(|sorted_set| sorted_set.zrange(start, end))
+    }
+
+    pub async fn zscore(&self, key: &str, member: &str) -> Option<f64> {
+        let sorted_set_map = self.sorted_set.read().await;
+        sorted_set_map
+            .get(key)
+            .and_then(|sorted_set| sorted_set.zscore(member))
     }
 }

@@ -90,7 +90,45 @@ pub async fn command_parser(cmd: &str, db: &Database) -> Result<String, String> 
                 Ok("$0\r\n:0\r\n".to_string())
             }
         }
-
+        ["ZADD", key, score_str, member] => {
+            let score = score_str.parse::<f64>().expect("Invalid score value");
+            if db.zadd(key.to_string(), member.to_string(), score).await {
+                Ok("$1\r\n:1\r\n".to_string())
+            } else {
+                Ok("$0\r\n:0\r\n".to_string())
+            }
+        }
+        ["ZREM", key, member] => {
+            if db.zrem(key, member).await {
+                Ok("$1\r\n:1\r\n".to_string())
+            } else {
+                Ok("$0\r\n:0\r\n".to_string())
+            }
+        }
+        ["ZRANGE", key, start_str, end_str] => {
+            let start = start_str.parse::<usize>().expect("Invalid start index");
+            let end = end_str.parse::<usize>().expect("Invalid end index");
+            if let Some(members) = db.zrange(key, start, end).await {
+                let mut response = format!("*{}\r\n", members.len());
+                for member in members {
+                    response.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                }
+                Ok(response)
+            } else {
+                Ok("$-1\r\n".to_string())
+            }
+        }
+        ["ZSCORE", key, member] => {
+            if let Some(score) = db.zscore(key, member).await {
+                Ok(format!(
+                    "${}\r\n{}\r\n",
+                    score.to_string().len(),
+                    score.to_string()
+                ))
+            } else {
+                Ok("$-1\r\n".to_string())
+            }
+        }
         _ => Ok("-ERR\r\nUnknown command".to_string()),
     }
 }
