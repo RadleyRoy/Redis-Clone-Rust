@@ -133,7 +133,6 @@ version = "0.1.0"
 dependencies = [
  "ordered-float",
  "tokio",
- "tokio-macros",
 ]
 
 [[package]]
