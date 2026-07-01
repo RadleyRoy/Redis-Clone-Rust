@@ -1,17 +1,18 @@
 //! Command handling, split into three clear stages:
 //!
-//! 1. [`Command::parse`] turns a raw inline request into a typed [`Command`],
-//!    reporting a protocol error for anything malformed.
+//! 1. [`Command::parse`] turns the already-tokenized request into a typed
+//!    [`Command`], reporting a [`CommandError`] for anything malformed.
 //! 2. [`execute`] runs a parsed command against the [`Database`].
 //! 3. [`resp`](crate::resp) turns the result into a RESP reply.
 //!
-//! Splitting parsing from execution keeps each stage small and independently
-//! testable, and means invalid client input produces an error reply instead of
-//! panicking a connection task.
+//! Parsing takes a slice of tokens rather than a raw line, so the same code
+//! serves both the inline protocol and RESP array requests — the server does
+//! the tokenizing and this module never cares which framing was used.
 
+use std::fmt;
 use std::str::FromStr;
 
-use crate::database::db::Database;
+use crate::database::db::{Database, StoreError};
 use crate::resp;
 
 /// A fully parsed, validated client command.
@@ -81,116 +82,153 @@ pub enum Command {
     },
 }
 
+/// Everything that can go wrong while parsing a request. Rendering happens via
+/// [`fmt::Display`], which produces the exact text of the RESP error (without
+/// the leading `-` or trailing CRLF that [`resp::error`] adds).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommandError {
+    Empty,
+    Unknown(String),
+    WrongArity(String),
+    NotAnInteger(String),
+    NotAFloat(String),
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CommandError::Empty => f.write_str("ERR empty command"),
+            CommandError::Unknown(name) => write!(f, "ERR unknown command '{name}'"),
+            CommandError::WrongArity(command) => write!(
+                f,
+                "ERR wrong number of arguments for '{}' command",
+                command.to_ascii_lowercase()
+            ),
+            CommandError::NotAnInteger(value) => {
+                write!(f, "ERR value '{value}' is not a valid integer")
+            }
+            CommandError::NotAFloat(value) => {
+                write!(f, "ERR value '{value}' is not a valid float")
+            }
+        }
+    }
+}
+
 impl Command {
-    /// Parses one inline command line. Command names are case-insensitive.
-    /// Returns an `ERR ...` message (without the RESP framing) on failure.
-    pub fn parse(input: &str) -> Result<Command, String> {
-        let mut parts = input.split_whitespace();
-        let name = parts.next().ok_or("ERR empty command")?;
-        let args: Vec<&str> = parts.collect();
+    /// Parses a tokenized request (command name followed by its arguments).
+    /// Command names are case-insensitive.
+    pub fn parse(tokens: &[String]) -> Result<Command, CommandError> {
+        let (name, args) = tokens.split_first().ok_or(CommandError::Empty)?;
 
         let command = match name.to_ascii_uppercase().as_str() {
-            "SET" => match args.as_slice() {
+            "SET" => match args {
                 [key, value] => Command::Set {
-                    key: key.to_string(),
-                    value: value.to_string(),
+                    key: key.clone(),
+                    value: value.clone(),
                     ttl: None,
                 },
                 [key, value, option, ttl]
                     if option.eq_ignore_ascii_case("EX") || option.eq_ignore_ascii_case("EXP") =>
                 {
                     Command::Set {
-                        key: key.to_string(),
-                        value: value.to_string(),
-                        ttl: Some(parse_number(ttl, "integer")?),
+                        key: key.clone(),
+                        value: value.clone(),
+                        ttl: Some(parse_number(ttl, CommandError::NotAnInteger)?),
                     }
                 }
                 _ => return Err(arity("SET")),
             },
             "GET" => Command::Get {
-                key: single_key(&args, "GET")?,
+                key: single_key(args, "GET")?,
             },
             "DEL" => Command::Del {
-                key: single_key(&args, "DEL")?,
+                key: single_key(args, "DEL")?,
             },
             "LPUSH" => {
-                let (key, value) = key_value(&args, "LPUSH")?;
+                let (key, value) = key_value(args, "LPUSH")?;
                 Command::LPush { key, value }
             }
             "RPUSH" => {
-                let (key, value) = key_value(&args, "RPUSH")?;
+                let (key, value) = key_value(args, "RPUSH")?;
                 Command::RPush { key, value }
             }
             "LPOP" => Command::LPop {
-                key: single_key(&args, "LPOP")?,
+                key: single_key(args, "LPOP")?,
             },
             "RPOP" => Command::RPop {
-                key: single_key(&args, "RPOP")?,
+                key: single_key(args, "RPOP")?,
             },
-            "LRANGE" => match args.as_slice() {
+            "LRANGE" => match args {
                 [key, start, stop] => Command::LRange {
-                    key: key.to_string(),
-                    start: parse_number(start, "integer")?,
-                    stop: parse_number(stop, "integer")?,
+                    key: key.clone(),
+                    start: parse_number(start, CommandError::NotAnInteger)?,
+                    stop: parse_number(stop, CommandError::NotAnInteger)?,
                 },
                 _ => return Err(arity("LRANGE")),
             },
             "SADD" => {
-                let (key, value) = key_value(&args, "SADD")?;
+                let (key, value) = key_value(args, "SADD")?;
                 Command::SAdd { key, value }
             }
             "SREM" => {
-                let (key, value) = key_value(&args, "SREM")?;
+                let (key, value) = key_value(args, "SREM")?;
                 Command::SRem { key, value }
             }
             "SMEMBERS" => Command::SMembers {
-                key: single_key(&args, "SMEMBERS")?,
+                key: single_key(args, "SMEMBERS")?,
             },
             "SISMEMBER" => {
-                let (key, value) = key_value(&args, "SISMEMBER")?;
+                let (key, value) = key_value(args, "SISMEMBER")?;
                 Command::SIsMember { key, value }
             }
-            "ZADD" => match args.as_slice() {
+            "ZADD" => match args {
                 [key, score, member] => Command::ZAdd {
-                    key: key.to_string(),
-                    member: member.to_string(),
-                    score: parse_number(score, "float")?,
+                    key: key.clone(),
+                    member: member.clone(),
+                    score: parse_number(score, CommandError::NotAFloat)?,
                 },
                 _ => return Err(arity("ZADD")),
             },
             "ZREM" => {
-                let (key, member) = key_value(&args, "ZREM")?;
+                let (key, member) = key_value(args, "ZREM")?;
                 Command::ZRem { key, member }
             }
-            "ZRANGE" => match args.as_slice() {
+            "ZRANGE" => match args {
                 [key, start, stop] => Command::ZRange {
-                    key: key.to_string(),
-                    start: parse_number(start, "integer")?,
-                    stop: parse_number(stop, "integer")?,
+                    key: key.clone(),
+                    start: parse_number(start, CommandError::NotAnInteger)?,
+                    stop: parse_number(stop, CommandError::NotAnInteger)?,
                 },
                 _ => return Err(arity("ZRANGE")),
             },
             "ZSCORE" => {
-                let (key, member) = key_value(&args, "ZSCORE")?;
+                let (key, member) = key_value(args, "ZSCORE")?;
                 Command::ZScore { key, member }
             }
-            _ => return Err(format!("ERR unknown command '{name}'")),
+            _ => return Err(CommandError::Unknown(name.clone())),
         };
         Ok(command)
     }
 }
 
-/// Parses and executes one inline request, returning the RESP reply to send
-/// back. A blank line produces no reply (an empty string).
-pub async fn handle(input: &str, db: &Database) -> String {
-    let input = input.trim();
-    if input.is_empty() {
+/// Parses a tokenized request and executes it, returning the RESP reply. An
+/// empty token list (a blank line) produces no reply.
+pub async fn dispatch(tokens: &[String], db: &Database) -> String {
+    if tokens.is_empty() {
         return String::new();
     }
-    match Command::parse(input) {
+    match Command::parse(tokens) {
         Ok(command) => execute(command, db).await,
-        Err(message) => resp::error(&message),
+        Err(error) => resp::error(&error.to_string()),
     }
+}
+
+/// Convenience wrapper for inline input: splits on whitespace and dispatches.
+/// Only used by tests; the server calls [`dispatch`] with already-read tokens.
+#[cfg(test)]
+async fn handle(input: &str, db: &Database) -> String {
+    let tokens: Vec<String> = input.split_whitespace().map(str::to_string).collect();
+    dispatch(&tokens, db).await
 }
 
 /// Runs a parsed command and encodes its outcome as a RESP reply.
@@ -217,39 +255,39 @@ async fn execute(command: Command, db: &Database) -> String {
         Command::ZScore { key, member } => match db.zscore(&key, &member).await {
             Ok(Some(score)) => resp::bulk_string(&format_score(score)),
             Ok(None) => resp::null(),
-            Err(message) => resp::error(&message),
+            Err(error) => resp::error(&error.to_string()),
         },
     }
 }
 
 // --- Reply encoding helpers -------------------------------------------------
 
-fn reply_optional(result: Result<Option<String>, String>) -> String {
+fn reply_optional(result: Result<Option<String>, StoreError>) -> String {
     match result {
         Ok(Some(value)) => resp::bulk_string(&value),
         Ok(None) => resp::null(),
-        Err(message) => resp::error(&message),
+        Err(error) => resp::error(&error.to_string()),
     }
 }
 
-fn reply_array(result: Result<Vec<String>, String>) -> String {
+fn reply_array(result: Result<Vec<String>, StoreError>) -> String {
     match result {
         Ok(values) => resp::array(&values),
-        Err(message) => resp::error(&message),
+        Err(error) => resp::error(&error.to_string()),
     }
 }
 
-fn reply_bool(result: Result<bool, String>) -> String {
+fn reply_bool(result: Result<bool, StoreError>) -> String {
     match result {
         Ok(value) => resp::integer(value as i64),
-        Err(message) => resp::error(&message),
+        Err(error) => resp::error(&error.to_string()),
     }
 }
 
-fn reply_count(result: Result<usize, String>) -> String {
+fn reply_count(result: Result<usize, StoreError>) -> String {
     match result {
         Ok(count) => resp::integer(count as i64),
-        Err(message) => resp::error(&message),
+        Err(error) => resp::error(&error.to_string()),
     }
 }
 
@@ -261,30 +299,29 @@ fn format_score(score: f64) -> String {
 
 // --- Argument parsing helpers -----------------------------------------------
 
-fn arity(command: &str) -> String {
-    format!(
-        "ERR wrong number of arguments for '{}' command",
-        command.to_ascii_lowercase()
-    )
+fn arity(command: &str) -> CommandError {
+    CommandError::WrongArity(command.to_string())
 }
 
-fn single_key(args: &[&str], command: &str) -> Result<String, String> {
+fn single_key(args: &[String], command: &str) -> Result<String, CommandError> {
     match args {
-        [key] => Ok(key.to_string()),
+        [key] => Ok(key.clone()),
         _ => Err(arity(command)),
     }
 }
 
-fn key_value(args: &[&str], command: &str) -> Result<(String, String), String> {
+fn key_value(args: &[String], command: &str) -> Result<(String, String), CommandError> {
     match args {
-        [key, value] => Ok((key.to_string(), value.to_string())),
+        [key, value] => Ok((key.clone(), value.clone())),
         _ => Err(arity(command)),
     }
 }
 
-fn parse_number<T: FromStr>(raw: &str, kind: &str) -> Result<T, String> {
-    raw.parse::<T>()
-        .map_err(|_| format!("ERR value '{raw}' is not a valid {kind}"))
+fn parse_number<T: FromStr>(
+    raw: &str,
+    to_error: fn(String) -> CommandError,
+) -> Result<T, CommandError> {
+    raw.parse::<T>().map_err(|_| to_error(raw.to_string()))
 }
 
 #[cfg(test)]
@@ -342,11 +379,26 @@ mod tests {
             handle("FOO bar", &db).await,
             "-ERR unknown command 'FOO'\r\n"
         );
-        assert_eq!(handle("GET", &db).await, arity_reply("GET"));
+        assert_eq!(
+            handle("GET", &db).await,
+            resp::error(&arity("GET").to_string())
+        );
         assert_eq!(handle("", &db).await, "");
     }
 
-    fn arity_reply(command: &str) -> String {
-        resp::error(&arity(command))
+    #[test]
+    fn command_error_messages_match_redis() {
+        assert_eq!(
+            CommandError::Unknown("X".into()).to_string(),
+            "ERR unknown command 'X'"
+        );
+        assert_eq!(
+            arity("SET").to_string(),
+            "ERR wrong number of arguments for 'set' command"
+        );
+        assert_eq!(
+            CommandError::NotAnInteger("z".into()).to_string(),
+            "ERR value 'z' is not a valid integer"
+        );
     }
 }

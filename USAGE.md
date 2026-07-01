@@ -21,18 +21,23 @@ Stop it with `Ctrl+C`.
 
 ## 2. Connecting
 
-The server understands the **inline** command protocol: send one command per
-line, with arguments separated by spaces, terminated by a newline. Any
-line-based TCP client works.
+The server accepts two request framings and picks one per line automatically:
 
-### Option A — `redis-cli`
+- **RESP arrays** — the multi-bulk format `redis-cli` sends. Values may contain
+  spaces (quote them). Recommended.
+- **Inline** — one whitespace-separated command per line, terminated by a
+  newline. Convenient for `telnet`/`netcat`, but values cannot contain spaces.
+
+### Option A — `redis-cli` (RESP)
 
 ```sh
 redis-cli -p 7335
 127.0.0.1:7335> SET greeting hello
 OK
-127.0.0.1:7335> GET greeting
-"hello"
+127.0.0.1:7335> SET note "hello world"   # spaces are fine over RESP
+OK
+127.0.0.1:7335> GET note
+"hello world"
 ```
 
 ### Option B — `telnet` / `netcat`
@@ -64,9 +69,11 @@ $reader.ReadLine()   # +OK
 $client.Close()
 ```
 
-> **Note:** Because arguments are split on whitespace, values themselves cannot
-> contain spaces (e.g. `SET note hello world` is parsed as three arguments and
-> rejected). Use a single token such as `hello_world`.
+> **Note:** With the **inline** framing (telnet/netcat/raw socket above),
+> arguments are split on whitespace, so a value cannot contain spaces
+> (`SET note hello world` is parsed as extra arguments and rejected). To store a
+> value with spaces, use `redis-cli` (or send a RESP array), which frames each
+> argument explicitly.
 
 ## 3. Understanding the replies
 

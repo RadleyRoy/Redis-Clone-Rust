@@ -126,15 +126,18 @@ Server starts at:
 
 # Connecting to the Server
 
-RustKV understands the **inline** protocol: one command per line, arguments separated by spaces. Use `redis-cli`, `telnet`, or `netcat`:
+RustKV accepts two request framings and detects them per line:
+
+- **RESP arrays** — the multi-bulk format `redis-cli` sends, so it works out of the box and values may contain spaces.
+- **Inline** — one whitespace-separated command per line, handy for `telnet`/`netcat`.
 
 ```bash
-redis-cli -p 7335      # inline mode
+redis-cli -p 7335              # RESP: SET note "hello world" works
 # or
-nc 127.0.0.1 7335
+nc 127.0.0.1 7335             # inline: type commands directly
 ```
 
-> Because arguments are split on whitespace, values cannot contain spaces.
+> With the inline framing, arguments are split on whitespace, so a value cannot contain spaces — use `redis-cli` (RESP) when you need spaces in a value.
 
 ---
 
@@ -219,12 +222,12 @@ DEL name                -> :1
 # Testing & CI
 
 ```bash
-cargo test        # run the unit tests (16 covering protocol, ranges, expiry, WRONGTYPE, ...)
+cargo test        # unit + end-to-end TCP tests (protocol, ranges, expiry, WRONGTYPE, ...)
 cargo clippy      # lint
-cargo fmt         # format
+cargo fmt --check # verify formatting
 ```
 
-A manually-triggered **Verify** GitHub Actions workflow runs the full pass (format, build, clippy, tests) and commits any formatting fixes. Launch it from the repository's **Actions → Verify → Run workflow**.
+A manually-triggered **Verify** GitHub Actions workflow runs each check — format, build, clippy, tests — as a separate, individually-visible step. Launch it from the repository's **Actions → Verify → Run workflow**. It is read-only and does not modify the repo.
 
 ---
 
@@ -242,6 +245,6 @@ ordered-float  # totally-ordered f64 for sorted-set scores
 This is a learning project, not a drop-in Redis replacement:
 
 - Only the commands above are implemented.
-- Requests use the **inline** protocol, so values cannot contain spaces, and full RESP array / pipelined requests are not parsed.
+- Requests are parsed as RESP arrays or inline commands, but replies are always inline RESP; there is no RESP3, and inline values cannot contain spaces (use `redis-cli`).
 - No persistence (RDB/AOF), replication, pub/sub, or clustering.
 - TTLs are evicted lazily (on access), not by a background sweeper.

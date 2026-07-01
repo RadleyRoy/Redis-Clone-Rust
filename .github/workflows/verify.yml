@@ -5,9 +5,9 @@ name: Verify
 on:
   workflow_dispatch:
 
-# Allow the job to push the auto-formatting commit back to the branch.
+# Read-only: this workflow verifies the code but never writes to the repo.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
@@ -24,30 +24,16 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      # Verification pass: format, build, clippy, tests.
-      # Formatting is applied (not just checked) so any fixes can be committed.
+      # Each check is its own step so its status and logs show up
+      # separately in the GitHub Actions UI.
       - name: Format
-        run: cargo fmt --all
+        run: cargo fmt --all --check
 
       - name: Build
         run: cargo build --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --locked
-
-      # Commit and push only the changes produced by the steps above
-      # (in practice, cargo fmt). No changes => nothing is committed.
-      - name: Commit and push changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "style: apply cargo fmt via Verify workflow"
-            git push origin HEAD:${{ github.ref_name }}
-          else
-            echo "Working tree clean - nothing to commit."
-          fi
