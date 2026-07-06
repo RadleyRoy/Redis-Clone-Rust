@@ -11,12 +11,15 @@
 //! logged without bringing the whole server down.
 
 use std::io::{Error, ErrorKind, Result};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::spawn;
+use tokio::{select, signal, spawn};
+use tracing::{debug, info, warn};
 
 use crate::command;
+use crate::config::Config;
 use crate::database::db::Database;
 
 /// Largest number of arguments accepted in a single RESP array request.
@@ -24,31 +27,60 @@ const MAX_MULTIBULK: usize = 1024 * 1024;
 /// Largest byte length accepted for a single RESP bulk-string argument.
 const MAX_BULK_BYTES: usize = 512 * 1024 * 1024;
 
-/// Binds to `address` and serves clients until the process is stopped. Returns
-/// an error only if the initial bind fails.
-pub async fn run(address: &str) -> Result<()> {
-    let listener = TcpListener::bind(address).await?;
-    eprintln!("Redis clone listening on {}", listener.local_addr()?);
-    accept_loop(listener).await
+/// Binds to the configured address and serves clients until interrupted with
+/// Ctrl+C. Returns an error only if the initial bind fails.
+pub async fn run(config: &Config) -> Result<()> {
+    let listener = TcpListener::bind(config.address()).await?;
+    info!(address = %listener.local_addr()?, "redis_clone listening");
+
+    let db = Database::new();
+    spawn_sweeper(db.clone(), config.sweep_interval());
+    accept_loop(listener, db).await
 }
 
-/// Accepts connections forever, spawning a task to serve each one.
-async fn accept_loop(listener: TcpListener) -> Result<()> {
-    let db = Database::new();
+/// Periodically evicts expired keys in the background, complementing the lazy
+/// eviction that happens on access.
+fn spawn_sweeper(db: Database, interval: Duration) {
+    spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // the first tick fires immediately; skip it
+        loop {
+            ticker.tick().await;
+            let removed = db.sweep_expired().await;
+            if removed > 0 {
+                debug!(removed, "swept expired keys");
+            }
+        }
+    });
+}
+
+/// Accepts connections until Ctrl+C, spawning a task to serve each one. On the
+/// shutdown signal it stops accepting and returns; in-flight connection tasks
+/// are left to finish on their own.
+async fn accept_loop(listener: TcpListener, db: Database) -> Result<()> {
     loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(connection) => connection,
-            Err(error) => {
-                eprintln!("failed to accept connection: {error}");
-                continue;
+        let (socket, peer) = select! {
+            result = listener.accept() => match result {
+                Ok(connection) => connection,
+                Err(cause) => {
+                    warn!(%cause, "failed to accept connection");
+                    continue;
+                }
+            },
+            _ = signal::ctrl_c() => {
+                info!("shutdown signal received; no longer accepting connections");
+                return Ok(());
             }
         };
 
         let db = db.clone();
         spawn(async move {
-            if let Err(error) = handle_connection(socket, db).await {
-                eprintln!("connection {peer} ended: {error}");
+            let clients = db.client_connected();
+            debug!(%peer, clients, "client connected");
+            if let Err(cause) = handle_connection(socket, db.clone()).await {
+                debug!(%peer, %cause, "connection ended");
             }
+            db.client_disconnected();
         });
     }
 }
@@ -150,7 +182,7 @@ mod tests {
     async fn start_server() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        spawn(accept_loop(listener));
+        spawn(accept_loop(listener, Database::new()));
         address
     }
 

@@ -5,19 +5,37 @@ every supported command with examples.
 
 ## 1. Running the server
 
-Build and start the server (it listens on `127.0.0.1:7335`):
+Build and start the server (it listens on `127.0.0.1:7335` by default):
 
 ```sh
 cargo run --release
 ```
 
-You should see:
+You should see a log line like:
 
 ```
-Redis clone listening on 127.0.0.1:7335
+2026-07-06T17:38:13Z  INFO redis_clone listening address=127.0.0.1:7335
 ```
 
-Stop it with `Ctrl+C`.
+Stop it with `Ctrl+C` — the server stops accepting connections and lets
+in-flight requests finish before exiting.
+
+### Configuration
+
+Each setting is a CLI flag with an environment-variable fallback:
+
+| Flag | Env var | Default | Description |
+| --- | --- | --- | --- |
+| `--host` | `REDIS_CLONE_HOST` | `127.0.0.1` | Address to bind. |
+| `--port` / `-p` | `REDIS_CLONE_PORT` | `7335` | Port to listen on. |
+| `--log-level` | `REDIS_CLONE_LOG` | `info` | `error`/`warn`/`info`/`debug`/`trace`. |
+| `--sweep-secs` | `REDIS_CLONE_SWEEP_SECS` | `10` | Background expiry sweep interval. |
+
+```sh
+cargo run --release -- --port 6400 --log-level debug
+```
+
+Run `cargo run -- --help` for the generated usage text.
 
 ## 2. Connecting
 
@@ -213,6 +231,21 @@ FLUSHALL             -> +OK
 PING                 -> +PONG
 PING hello           -> "hello"
 ECHO hi              -> "hi"
+```
+
+#### `INFO`
+
+Returns a Redis-style block of server statistics: uptime, connected clients, and
+key count.
+
+```
+INFO                 -> # Server
+                        server_name:redis_clone
+                        uptime_in_seconds:42
+                        # Clients
+                        connected_clients:1
+                        # Keyspace
+                        keys:3
 ```
 
 ### Lists

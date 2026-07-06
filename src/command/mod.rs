@@ -145,6 +145,7 @@ pub enum Command {
     },
     DbSize,
     FlushAll,
+    Info,
     IncrBy {
         key: String,
         delta: i64,
@@ -436,6 +437,9 @@ impl Command {
                 [] => Command::FlushAll,
                 _ => return Err(arity("FLUSHALL")),
             },
+            // `INFO [section]` — the optional section argument is accepted and
+            // ignored; the full block is always returned.
+            "INFO" => Command::Info,
             "INCR" => Command::IncrBy {
                 key: single_key(args, "INCR")?,
                 delta: 1,
@@ -654,6 +658,7 @@ async fn execute(command: Command, db: &Database) -> String {
             db.flushall().await;
             resp::simple_string("OK")
         }
+        Command::Info => resp::bulk_string(&db.info().await),
         Command::IncrBy { key, delta } => reply_signed(db.incr_by(key, delta).await),
         Command::Append { key, value } => reply_count(db.append(key, &value).await),
         Command::StrLen { key } => reply_count(db.strlen(&key).await),

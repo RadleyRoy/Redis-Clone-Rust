@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
@@ -230,11 +231,37 @@ fn set_members_of(store: &Store, key: &str) -> Result<HashSet<String>, StoreErro
     }
 }
 
+/// Server-wide counters that back the `INFO` command. Shared across every
+/// connection alongside the key store.
+struct Stats {
+    started_at: Instant,
+    connected_clients: AtomicUsize,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            connected_clients: AtomicUsize::new(0),
+        }
+    }
+}
+
 /// A thread-safe, in-memory store. Cloning shares the same underlying data, so
 /// every connection task operates on one database.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Database {
     store: Arc<RwLock<Store>>,
+    stats: Arc<Stats>,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            store: Arc::new(RwLock::new(HashMap::new())),
+            stats: Arc::new(Stats::new()),
+        }
+    }
 }
 
 impl Database {
@@ -952,6 +979,45 @@ impl Database {
     pub async fn flushall(&self) {
         self.store.write().await.clear();
     }
+
+    // --- Server / maintenance -------------------------------------------
+
+    /// Evicts every expired key under one write lock, returning how many were
+    /// removed. Backs the background sweeper; lazy eviction still happens on
+    /// access, so this is an optimisation, not a correctness requirement.
+    pub async fn sweep_expired(&self) -> usize {
+        let mut store = self.store.write().await;
+        let before = store.len();
+        store.retain(|_, entry| !entry.is_expired());
+        before - store.len()
+    }
+
+    /// Records a newly connected client, returning the new client count.
+    pub fn client_connected(&self) -> usize {
+        self.stats.connected_clients.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Records a client disconnecting.
+    pub fn client_disconnected(&self) {
+        self.stats.connected_clients.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Renders the `INFO` reply: a human-readable, Redis-style block of
+    /// `field:value` lines grouped into sections.
+    pub async fn info(&self) -> String {
+        let uptime = self.stats.started_at.elapsed().as_secs();
+        let clients = self.stats.connected_clients.load(Ordering::Relaxed);
+        let keys = self.dbsize().await;
+        format!(
+            "# Server\r\n\
+             server_name:redis_clone\r\n\
+             uptime_in_seconds:{uptime}\r\n\
+             \r\n# Clients\r\n\
+             connected_clients:{clients}\r\n\
+             \r\n# Keyspace\r\n\
+             keys:{keys}\r\n"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -995,6 +1061,29 @@ mod tests {
         let db = Database::new();
         db.set("k".to_string(), "v".to_string(), Some(0)).await;
         assert_eq!(db.get("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_only_expired_keys() {
+        let db = Database::new();
+        db.set("live".to_string(), "v".to_string(), None).await;
+        db.set("gone".to_string(), "v".to_string(), Some(0)).await;
+        assert_eq!(db.sweep_expired().await, 1);
+        assert_eq!(db.dbsize().await, 1);
+        assert_eq!(db.get("live").await.unwrap(), Some("v".to_string()));
+    }
+
+    #[tokio::test]
+    async fn info_reports_clients_and_keys() {
+        let db = Database::new();
+        db.set("k".to_string(), "v".to_string(), None).await;
+        assert_eq!(db.client_connected(), 1);
+        assert_eq!(db.client_connected(), 2);
+        db.client_disconnected();
+        let info = db.info().await;
+        assert!(info.contains("connected_clients:1"), "{info}");
+        assert!(info.contains("keys:1"), "{info}");
+        assert!(info.contains("uptime_in_seconds:"), "{info}");
     }
 
     #[tokio::test]

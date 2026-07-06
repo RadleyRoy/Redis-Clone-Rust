@@ -15,8 +15,10 @@ This project demonstrates building a **high-performance async database server fr
 - In-memory key-value storage guarded by `Arc<RwLock<_>>`
 - Multiple Redis-like data structures (strings, lists, sets, sorted sets, hashes)
 - Over 50 commands, including variadic forms (`DEL k1 k2`, `RPUSH k a b c`)
-- Key expiration with `EXPIRE`/`TTL`/`PERSIST`, evicted lazily on access
+- Key expiration with `EXPIRE`/`TTL`/`PERSIST`, evicted lazily **and** by a background sweeper
 - Generic key commands (`EXISTS`, `TYPE`, `KEYS` with glob matching, `RENAME`, ...)
+- Configurable host/port/log-level via CLI flags or environment variables
+- Structured logging with `tracing`, `INFO` introspection, and graceful Ctrl+C shutdown
 - Proper RESP replies, including `WRONGTYPE` errors for type mismatches
 - Robust input handling: malformed commands return an error reply, never a crash
 
@@ -57,7 +59,9 @@ A request flows in a straight line: the **server** reads a line and hands it to 
 ```
 src
 │
-├── main.rs                 # entry point; starts the server
+├── main.rs                 # entry point; parses config, starts the server
+│
+├── config.rs               # CLI/env configuration (clap)
 │
 ├── resp.rs                 # RESP reply encoders (the wire format)
 │
@@ -119,11 +123,30 @@ cargo build --release
 cargo run --release
 ```
 
-Server starts at:
+Server starts at `127.0.0.1:7335` and logs to stderr. Stop it with `Ctrl+C`,
+which triggers a graceful shutdown (it stops accepting new connections and lets
+in-flight ones finish).
 
+---
+
+# Configuration
+
+Every setting is a CLI flag with an environment-variable fallback:
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--host` | `REDIS_CLONE_HOST` | `127.0.0.1` | Address to bind. |
+| `--port` / `-p` | `REDIS_CLONE_PORT` | `7335` | Port to listen on. |
+| `--log-level` | `REDIS_CLONE_LOG` | `info` | `error`/`warn`/`info`/`debug`/`trace`. |
+| `--sweep-secs` | `REDIS_CLONE_SWEEP_SECS` | `10` | Background expiry sweep interval. |
+
+```bash
+cargo run --release -- --port 6400 --log-level debug
+# or
+REDIS_CLONE_PORT=6400 cargo run --release
 ```
-127.0.0.1:7335
-```
+
+Run `cargo run -- --help` for the full generated usage.
 
 ---
 
@@ -164,6 +187,7 @@ These work on a key of any type.
 | `RENAME key newkey` | Rename a key (moving its value and TTL); errors if it is missing. |
 | `DBSIZE` | Return the number of live keys. |
 | `FLUSHALL` | Remove every key. |
+| `INFO` | Return server stats (uptime, connected clients, key count). |
 | `PING [message]` | Reply `+PONG`, or echo `message` if given. |
 | `ECHO message` | Reply with `message`. |
 
@@ -244,7 +268,7 @@ Hashes map string fields to string values under a single key.
 
 # TTL Expiration
 
-A key set with `EX seconds` stores an expiry deadline alongside its value. Expiration is **lazy**: on the next access after the deadline passes, the key is treated as missing and evicted. There is no background sweeper.
+A key set with `EX seconds` (or given a TTL via `EXPIRE`) stores an expiry deadline alongside its value. Expiration is **lazy** — on the next access after the deadline passes, the key is treated as missing and evicted — **and** a background sweeper periodically removes expired keys even if they are never touched again (interval set by `--sweep-secs`).
 
 ---
 
@@ -290,8 +314,11 @@ A manually-triggered **Verify** GitHub Actions workflow runs each check — form
 # Dependencies
 
 ```toml
-tokio          # async runtime
-ordered-float  # totally-ordered f64 for sorted-set scores
+tokio               # async runtime
+ordered-float       # totally-ordered f64 for sorted-set scores
+clap                # CLI argument / environment parsing
+tracing             # structured, levelled logging
+tracing-subscriber  # log formatting and filtering
 ```
 
 ---
@@ -303,4 +330,4 @@ This is a learning project, not a drop-in Redis replacement:
 - Only the commands above are implemented (no scripting, streams, or bitmaps).
 - Requests are parsed as RESP arrays or inline commands, but replies are always RESP2; there is no RESP3, and inline values cannot contain spaces (use `redis-cli`).
 - No persistence (RDB/AOF), replication, pub/sub, transactions, or clustering.
-- A single database (no `SELECT`), and TTLs are evicted lazily (on access), not by a background sweeper.
+- A single database (no `SELECT`).
