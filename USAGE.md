@@ -543,3 +543,65 @@ GET counter          -> "1"
 
 When AOF is enabled it is the source of truth for recovery, and the snapshot is
 not loaded.
+
+## 8. Transactions
+
+`MULTI` starts a transaction. Commands sent afterwards are not run immediately —
+they reply `+QUEUED` and are held until `EXEC`, which runs them in order and
+replies with an array of their individual results. `DISCARD` throws the queue
+away.
+
+```
+MULTI                -> +OK
+SET a 1              -> +QUEUED
+INCR a               -> +QUEUED
+EXEC                 -> 1) +OK
+                        2) (integer) 2
+GET a                -> "2"
+```
+
+If a queued command cannot be *parsed* (unknown command, wrong arity), the whole
+transaction is marked dirty and `EXEC` aborts:
+
+```
+MULTI                -> +OK
+NOSUCHCMD            -> -ERR unknown command 'NOSUCHCMD'
+EXEC                 -> -EXECABORT Transaction discarded because of previous errors.
+```
+
+A per-command *runtime* error (such as `WRONGTYPE`) does not abort the
+transaction — like Redis, the other commands still run and the error appears in
+its slot of the `EXEC` array.
+
+## 9. Pub/Sub
+
+`SUBSCRIBE` puts a connection into subscribe mode, where it receives messages
+published to its channels. `PUBLISH` returns the number of subscribers that
+received the message.
+
+Open two clients. In the first:
+
+```
+SUBSCRIBE news
+1) "subscribe"
+2) "news"
+3) (integer) 1
+```
+
+In the second:
+
+```
+PUBLISH news "hello"   -> (integer) 1
+```
+
+The first client then receives:
+
+```
+1) "message"
+2) "news"
+3) "hello"
+```
+
+`UNSUBSCRIBE` (optionally with specific channels) leaves subscribe mode. While
+subscribed, only `SUBSCRIBE`, `UNSUBSCRIBE`, and `PING` are accepted on that
+connection.

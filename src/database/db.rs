@@ -18,11 +18,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Duration, Instant};
 use tracing::warn;
 
 use crate::database::aof::Aof;
 use crate::database::data_structure::{RHash, RList, RSet, RSortedSet};
+use crate::database::pubsub::PubSub;
 use crate::database::snapshot::{SerValue, Snapshot, SnapshotEntry};
 
 /// Errors the store can return to a caller.
@@ -269,6 +271,7 @@ pub struct Database {
     store: Arc<RwLock<Store>>,
     stats: Arc<Stats>,
     persistence: Arc<Persistence>,
+    pubsub: Arc<PubSub>,
 }
 
 impl Default for Database {
@@ -277,6 +280,7 @@ impl Default for Database {
             store: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(Stats::new()),
             persistence: Arc::new(Persistence::default()),
+            pubsub: Arc::new(PubSub::default()),
         }
     }
 }
@@ -1046,6 +1050,29 @@ impl Database {
              \r\n# Keyspace\r\n\
              keys:{keys}\r\n"
         )
+    }
+
+    // --- Pub/Sub --------------------------------------------------------
+
+    /// Hands out a process-unique id for a subscribing connection.
+    pub fn next_subscriber_id(&self) -> u64 {
+        self.pubsub.next_id()
+    }
+
+    /// Registers a connection's mailbox as a subscriber on `channel`.
+    pub fn subscribe(&self, channel: String, id: u64, sender: UnboundedSender<String>) {
+        self.pubsub.subscribe(channel, id, sender);
+    }
+
+    /// Removes a connection's subscription to `channel`.
+    pub fn unsubscribe(&self, channel: &str, id: u64) {
+        self.pubsub.unsubscribe(channel, id);
+    }
+
+    /// Publishes `payload` to `channel`, returning the number of subscribers
+    /// that received it.
+    pub fn publish(&self, channel: &str, payload: &str) -> usize {
+        self.pubsub.publish(channel, payload)
     }
 
     // --- Persistence ----------------------------------------------------

@@ -3,6 +3,7 @@ mod config;
 mod database;
 mod resp;
 mod server;
+mod session;
 
 use std::str::FromStr;
 

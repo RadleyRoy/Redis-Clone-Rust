@@ -20,6 +20,7 @@ This project demonstrates building a **high-performance async database server fr
 - Configurable host/port/log-level via CLI flags or environment variables
 - Structured logging with `tracing`, `INFO` introspection, and graceful Ctrl+C shutdown
 - Persistence: JSON snapshots (`SAVE`/`BGSAVE`, load-on-startup) and an append-only log (AOF) with a configurable fsync policy
+- Pub/Sub (`SUBSCRIBE`/`PUBLISH`) and transactions (`MULTI`/`EXEC`/`DISCARD`) via a per-connection session
 - Proper RESP replies, including `WRONGTYPE` errors for type mismatches
 - Robust input handling: malformed commands return an error reply, never a crash
 
@@ -64,6 +65,8 @@ src
 │
 ├── config.rs               # CLI/env configuration (clap)
 │
+├── session.rs              # per-connection state: transactions + subscribe mode
+│
 ├── resp.rs                 # RESP reply encoders (the wire format)
 │
 ├── server
@@ -74,7 +77,10 @@ src
 │
 └── database
     ├── db.rs               # thread-safe key/value store (expiry + type checks)
-    └── data_structure.rs   # RList, RSet, RSortedSet, RHash value types
+    ├── data_structure.rs   # RList, RSet, RSortedSet, RHash value types
+    ├── snapshot.rs         # serializable snapshot format (RDB)
+    ├── aof.rs              # append-only log + fsync policy
+    └── pubsub.rs           # channel → subscribers registry
 ```
 
 ---
@@ -271,6 +277,27 @@ Hashes map string fields to string values under a single key.
 | `HEXISTS key field` | Return `1` if the field exists, else `0`. |
 | `HINCRBY key field n` | Increment a field's integer value by `n`. Returns the new value. |
 
+## Pub/Sub
+
+| Command | Description |
+|---|---|
+| `SUBSCRIBE channel [channel ...]` | Subscribe to channels; the connection then also receives pushed messages. |
+| `UNSUBSCRIBE [channel ...]` | Unsubscribe from the given channels (or all if none given). |
+| `PUBLISH channel message` | Send a message to a channel. Returns the number of subscribers that received it. |
+
+While subscribed, only `SUBSCRIBE`/`UNSUBSCRIBE`/`PING` are accepted on that connection.
+
+## Transactions
+
+| Command | Description |
+|---|---|
+| `MULTI` | Begin a transaction; subsequent commands reply `+QUEUED`. |
+| `EXEC` | Run the queued commands and reply with an array of their results. |
+| `DISCARD` | Abort the transaction, discarding the queue. |
+
+If a queued command fails to *parse*, `EXEC` aborts with `EXECABORT`. Per-command
+runtime errors (e.g. `WRONGTYPE`) do not abort the transaction, matching Redis.
+
 ---
 
 # TTL Expiration
@@ -362,4 +389,5 @@ This is a learning project, not a drop-in Redis replacement:
 - Only the commands above are implemented (no scripting, streams, or bitmaps).
 - Requests are parsed as RESP arrays or inline commands, but replies are always RESP2; there is no RESP3, and inline values cannot contain spaces (use `redis-cli`).
 - Snapshots are JSON (not the real Redis binary RDB format), and the AOF is never rewritten/compacted, so it grows without bound.
-- No replication, pub/sub, transactions, or clustering, and a single database (no `SELECT`).
+- Transactions run their queued commands in order but are not isolated from other connections (no `WATCH`), and there is a single database (no `SELECT`).
+- No pattern subscriptions (`PSUBSCRIBE`), replication, or clustering.

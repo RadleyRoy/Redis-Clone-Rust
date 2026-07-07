@@ -151,6 +151,10 @@ pub enum Command {
     Info,
     Save,
     BgSave,
+    Publish {
+        channel: String,
+        message: String,
+    },
     IncrBy {
         key: String,
         delta: i64,
@@ -447,6 +451,10 @@ impl Command {
             "INFO" => Command::Info,
             "SAVE" => Command::Save,
             "BGSAVE" => Command::BgSave,
+            "PUBLISH" => {
+                let (channel, message) = key_value(args, "PUBLISH")?;
+                Command::Publish { channel, message }
+            }
             "INCR" => Command::IncrBy {
                 key: single_key(args, "INCR")?,
                 delta: 1,
@@ -720,6 +728,9 @@ async fn execute(command: Command, db: &Database) -> String {
                 }
             });
             resp::simple_string("Background saving started")
+        }
+        Command::Publish { channel, message } => {
+            resp::integer(db.publish(&channel, &message) as i64)
         }
         Command::IncrBy { key, delta } => reply_signed(db.incr_by(key, delta).await),
         Command::Append { key, value } => reply_count(db.append(key, &value).await),

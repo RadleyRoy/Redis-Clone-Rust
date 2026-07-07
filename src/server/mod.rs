@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::{select, signal, spawn};
 use tracing::{debug, info, warn};
 
@@ -23,6 +24,7 @@ use crate::command;
 use crate::config::Config;
 use crate::database::aof::{Aof, FsyncPolicy};
 use crate::database::db::Database;
+use crate::session::Session;
 
 /// Largest number of arguments accepted in a single RESP array request.
 const MAX_MULTIBULK: usize = 1024 * 1024;
@@ -176,17 +178,44 @@ async fn accept_loop(listener: TcpListener, db: Database) -> Result<()> {
     }
 }
 
-/// Serves a single client: one request per iteration until the peer disconnects.
+/// Serves a single client until it disconnects.
+///
+/// Requests are read in a dedicated task and delivered over a channel, so the
+/// main loop can wait on *either* the next request *or* a pub/sub message
+/// without a message ever cancelling a half-finished read.
 async fn handle_connection(socket: TcpStream, db: Database) -> Result<()> {
     let (reader, mut writer) = socket.into_split();
-    let mut reader = BufReader::new(reader);
+    let (mut session, mut mailbox) = Session::new(db);
 
-    while let Some(tokens) = read_request(&mut reader).await? {
-        let response = command::dispatch(&tokens, &db).await;
-        if !response.is_empty() {
-            writer.write_all(response.as_bytes()).await?;
+    let (requests_tx, mut requests) = mpsc::channel::<Vec<String>>(16);
+    let reader_task = spawn(async move {
+        let mut reader = BufReader::new(reader);
+        while let Ok(Some(tokens)) = read_request(&mut reader).await {
+            if requests_tx.send(tokens).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        select! {
+            request = requests.recv() => match request {
+                Some(tokens) => {
+                    let reply = session.handle(&tokens).await;
+                    if !reply.is_empty() {
+                        writer.write_all(reply.as_bytes()).await?;
+                    }
+                }
+                None => break, // the reader task ended (EOF or protocol error)
+            },
+            Some(message) = mailbox.recv() => {
+                writer.write_all(message.as_bytes()).await?;
+            }
         }
     }
+
+    session.cleanup();
+    reader_task.abort();
     Ok(())
 }
 
@@ -311,5 +340,78 @@ mod tests {
     async fn multibulk_length_out_of_range_is_rejected() {
         let mut input = BufReader::new(&b"*99999999999999\r\n"[..]);
         assert!(read_request(&mut input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn transaction_queues_and_execs() {
+        let address = start_server().await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        writer.write_all(b"MULTI\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "+OK\r\n");
+        writer.write_all(b"SET k 1\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "+QUEUED\r\n");
+        writer.write_all(b"INCR k\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "+QUEUED\r\n");
+
+        // EXEC returns an array of each queued command's reply.
+        writer.write_all(b"EXEC\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "*2\r\n");
+        assert_eq!(next_line(&mut reader).await, "+OK\r\n");
+        assert_eq!(next_line(&mut reader).await, ":2\r\n");
+    }
+
+    #[tokio::test]
+    async fn exec_without_multi_is_an_error() {
+        let address = start_server().await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        writer.write_all(b"EXEC\r\n").await.unwrap();
+        assert!(
+            next_line(&mut reader)
+                .await
+                .starts_with("-ERR EXEC without MULTI")
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_a_subscriber() {
+        let address = start_server().await;
+
+        // Subscriber connection.
+        let sub = TcpStream::connect(address).await.unwrap();
+        let (sub_reader, mut sub_writer) = sub.into_split();
+        let mut sub_reader = BufReader::new(sub_reader);
+        sub_writer.write_all(b"SUBSCRIBE news\r\n").await.unwrap();
+        // Confirmation: *3 / $9 subscribe / $4 news / :1
+        assert_eq!(next_line(&mut sub_reader).await, "*3\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$9\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "subscribe\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$4\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "news\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, ":1\r\n");
+
+        // Publisher connection.
+        let pub_stream = TcpStream::connect(address).await.unwrap();
+        let (pub_reader, mut pub_writer) = pub_stream.into_split();
+        let mut pub_reader = BufReader::new(pub_reader);
+        pub_writer
+            .write_all(b"PUBLISH news hello\r\n")
+            .await
+            .unwrap();
+        assert_eq!(next_line(&mut pub_reader).await, ":1\r\n"); // one subscriber
+
+        // The subscriber receives the message: *3 / $7 message / $4 news / $5 hello
+        assert_eq!(next_line(&mut sub_reader).await, "*3\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$7\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "message\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$4\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "news\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$5\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "hello\r\n");
     }
 }
