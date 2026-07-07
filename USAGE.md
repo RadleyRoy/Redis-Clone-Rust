@@ -30,6 +30,10 @@ Each setting is a CLI flag with an environment-variable fallback:
 | `--port` / `-p` | `REDIS_CLONE_PORT` | `7335` | Port to listen on. |
 | `--log-level` | `REDIS_CLONE_LOG` | `info` | `error`/`warn`/`info`/`debug`/`trace`. |
 | `--sweep-secs` | `REDIS_CLONE_SWEEP_SECS` | `10` | Background expiry sweep interval. |
+| `--snapshot-file` | `REDIS_CLONE_SNAPSHOT` | `dump.rdb.json` | JSON snapshot path. |
+| `--appendonly` | `REDIS_CLONE_APPENDONLY` | `false` | Enable the append-only log. |
+| `--appendfsync` | `REDIS_CLONE_APPENDFSYNC` | `everysec` | AOF fsync policy: `always`/`everysec`/`no`. |
+| `--aof-file` | `REDIS_CLONE_AOF_FILE` | `appendonly.aof` | Append-only file path. |
 
 ```sh
 cargo run --release -- --port 6400 --log-level debug
@@ -247,6 +251,20 @@ INFO                 -> # Server
                         # Keyspace
                         keys:3
 ```
+
+#### `SAVE` / `BGSAVE`
+
+Persist a JSON snapshot to the configured `--snapshot-file`. `SAVE` writes
+synchronously and replies `+OK`; `BGSAVE` spawns the write and replies
+immediately. A snapshot is also written automatically on a graceful shutdown,
+and loaded on startup.
+
+```
+SAVE                 -> +OK
+BGSAVE               -> Background saving started
+```
+
+See [section 7](#7-persistence) for how snapshots and the AOF fit together.
 
 ### Lists
 
@@ -467,14 +485,61 @@ Malformed input never crashes the server — it always produces an error reply.
 SET user:1 radley           -> +OK
 GET user:1                  -> "radley"
 SET session abc EX 30       -> +OK
-RPUSH tasks buy-milk        -> (integer) 1
-RPUSH tasks walk-dog        -> (integer) 2
+RPUSH tasks buy-milk walk-dog -> (integer) 2
 LRANGE tasks 0 -1           -> [buy-milk, walk-dog]
-SADD tags rust go           -> -ERR wrong number of arguments for 'sadd' command
-SADD tags rust              -> (integer) 1
-ZADD scores 10 alice        -> (integer) 1
-ZADD scores 7 bob           -> (integer) 1
+SADD tags rust go           -> (integer) 2
+ZADD scores 10 alice 7 bob  -> (integer) 2
 ZRANGE scores 0 -1          -> [bob, alice]
-DEL user:1                  -> (integer) 1
+DEL user:1 tags             -> (integer) 2
 GET user:1                  -> (nil)
 ```
+
+## 7. Persistence
+
+State can outlive a restart through two independent mechanisms.
+
+### Snapshots (RDB-style)
+
+The whole keyspace is serialized to a JSON file (`--snapshot-file`, default
+`dump.rdb.json`). A snapshot is written on `SAVE`/`BGSAVE` and on a graceful
+shutdown, and loaded automatically on startup. TTLs are stored as the number of
+seconds remaining, so they survive the restart.
+
+```sh
+# terminal 1
+cargo run -- --snapshot-file dump.rdb.json
+```
+
+```
+SET user:1 radley    -> +OK
+SAVE                 -> +OK          # dump.rdb.json now on disk
+# stop the server, start it again — the key is back:
+GET user:1           -> "radley"
+```
+
+### Append-only file (AOF)
+
+With `--appendonly`, every successful write is appended to a log (`--aof-file`,
+default `appendonly.aof`) in the same RESP framing clients send, and the log is
+replayed on startup. `--appendfsync` trades durability for speed:
+
+| Policy | Behaviour |
+| --- | --- |
+| `always` | `fsync` after every write (safest, slowest). |
+| `everysec` | `fsync` about once per second in the background (default). |
+| `no` | Let the OS decide when to flush. |
+
+```sh
+cargo run -- --appendonly --appendfsync always
+```
+
+```
+SET aofkey world     -> +OK
+INCR counter         -> (integer) 1
+# kill -9 the server (a crash), restart with --appendonly:
+GET aofkey           -> "world"      # replayed from the AOF
+GET counter          -> "1"
+```
+
+When AOF is enabled it is the source of truth for recovery, and the snapshot is
+not loaded.

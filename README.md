@@ -19,6 +19,7 @@ This project demonstrates building a **high-performance async database server fr
 - Generic key commands (`EXISTS`, `TYPE`, `KEYS` with glob matching, `RENAME`, ...)
 - Configurable host/port/log-level via CLI flags or environment variables
 - Structured logging with `tracing`, `INFO` introspection, and graceful Ctrl+C shutdown
+- Persistence: JSON snapshots (`SAVE`/`BGSAVE`, load-on-startup) and an append-only log (AOF) with a configurable fsync policy
 - Proper RESP replies, including `WRONGTYPE` errors for type mismatches
 - Robust input handling: malformed commands return an error reply, never a crash
 
@@ -139,6 +140,10 @@ Every setting is a CLI flag with an environment-variable fallback:
 | `--port` / `-p` | `REDIS_CLONE_PORT` | `7335` | Port to listen on. |
 | `--log-level` | `REDIS_CLONE_LOG` | `info` | `error`/`warn`/`info`/`debug`/`trace`. |
 | `--sweep-secs` | `REDIS_CLONE_SWEEP_SECS` | `10` | Background expiry sweep interval. |
+| `--snapshot-file` | `REDIS_CLONE_SNAPSHOT` | `dump.rdb.json` | JSON snapshot path. |
+| `--appendonly` | `REDIS_CLONE_APPENDONLY` | `false` | Enable the append-only log. |
+| `--appendfsync` | `REDIS_CLONE_APPENDFSYNC` | `everysec` | AOF fsync policy: `always`/`everysec`/`no`. |
+| `--aof-file` | `REDIS_CLONE_AOF_FILE` | `appendonly.aof` | Append-only file path. |
 
 ```bash
 cargo run --release -- --port 6400 --log-level debug
@@ -188,6 +193,8 @@ These work on a key of any type.
 | `DBSIZE` | Return the number of live keys. |
 | `FLUSHALL` | Remove every key. |
 | `INFO` | Return server stats (uptime, connected clients, key count). |
+| `SAVE` | Write a snapshot to the configured file (synchronously). |
+| `BGSAVE` | Write a snapshot in the background. |
 | `PING [message]` | Reply `+PONG`, or echo `message` if given. |
 | `ECHO message` | Reply with `message`. |
 
@@ -272,6 +279,30 @@ A key set with `EX seconds` (or given a TTL via `EXPIRE`) stores an expiry deadl
 
 ---
 
+# Persistence
+
+Two independent mechanisms let data survive a restart:
+
+- **Snapshots (RDB-style).** The whole keyspace is serialized to a JSON file
+  (`--snapshot-file`, default `dump.rdb.json`) — on `SAVE`/`BGSAVE` and on a
+  graceful shutdown — and loaded back on startup. TTLs are stored as *remaining
+  seconds* so they mean the same thing after a restart.
+- **Append-only file (AOF).** With `--appendonly`, every successful write is
+  appended to a log in the same RESP framing clients use, and the log is
+  replayed on startup to rebuild state. `--appendfsync` chooses durability:
+  `always` (fsync per write), `everysec` (a background flush each second), or
+  `no` (leave it to the OS). When AOF is on, it is the source of truth for
+  recovery and the snapshot is not loaded.
+
+```
+SET user:1 radley
+SAVE                    -> +OK      # writes dump.rdb.json
+# ... restart the server ...
+GET user:1              -> "radley" # loaded on startup
+```
+
+---
+
 # Concurrency Model
 
 RustKV serves multiple clients simultaneously:
@@ -319,6 +350,7 @@ ordered-float       # totally-ordered f64 for sorted-set scores
 clap                # CLI argument / environment parsing
 tracing             # structured, levelled logging
 tracing-subscriber  # log formatting and filtering
+serde / serde_json  # snapshot (de)serialization
 ```
 
 ---
@@ -329,5 +361,5 @@ This is a learning project, not a drop-in Redis replacement:
 
 - Only the commands above are implemented (no scripting, streams, or bitmaps).
 - Requests are parsed as RESP arrays or inline commands, but replies are always RESP2; there is no RESP3, and inline values cannot contain spaces (use `redis-cli`).
-- No persistence (RDB/AOF), replication, pub/sub, transactions, or clustering.
-- A single database (no `SELECT`).
+- Snapshots are JSON (not the real Redis binary RDB format), and the AOF is never rewritten/compacted, so it grows without bound.
+- No replication, pub/sub, transactions, or clustering, and a single database (no `SELECT`).

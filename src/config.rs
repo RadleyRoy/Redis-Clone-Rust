@@ -31,6 +31,25 @@ pub struct Config {
     /// How often, in seconds, the background sweeper evicts expired keys.
     #[arg(long, env = "REDIS_CLONE_SWEEP_SECS", default_value_t = 10)]
     pub sweep_secs: u64,
+
+    /// Path to the JSON snapshot file, loaded on startup and written by SAVE
+    /// and on shutdown.
+    #[arg(long, env = "REDIS_CLONE_SNAPSHOT", default_value = "dump.rdb.json")]
+    pub snapshot_file: String,
+
+    /// Append every write to a log and replay it on startup (durability at the
+    /// cost of throughput). When enabled, the AOF is used for recovery instead
+    /// of the snapshot.
+    #[arg(long, env = "REDIS_CLONE_APPENDONLY", default_value_t = false)]
+    pub appendonly: bool,
+
+    /// AOF fsync policy: always, everysec, or no.
+    #[arg(long, env = "REDIS_CLONE_APPENDFSYNC", default_value = "everysec")]
+    pub appendfsync: String,
+
+    /// Path to the append-only file.
+    #[arg(long, env = "REDIS_CLONE_AOF_FILE", default_value = "appendonly.aof")]
+    pub aof_file: String,
 }
 
 impl Config {

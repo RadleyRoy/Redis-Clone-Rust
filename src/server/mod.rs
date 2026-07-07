@@ -11,6 +11,7 @@
 //! logged without bringing the whole server down.
 
 use std::io::{Error, ErrorKind, Result};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -20,6 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::command;
 use crate::config::Config;
+use crate::database::aof::{Aof, FsyncPolicy};
 use crate::database::db::Database;
 
 /// Largest number of arguments accepted in a single RESP array request.
@@ -33,9 +35,98 @@ pub async fn run(config: &Config) -> Result<()> {
     let listener = TcpListener::bind(config.address()).await?;
     info!(address = %listener.local_addr()?, "redis_clone listening");
 
-    let db = Database::new();
+    let snapshot_path = PathBuf::from(&config.snapshot_file);
+    let (db, aof_policy) = init_persistence(config, snapshot_path).await?;
+
     spawn_sweeper(db.clone(), config.sweep_interval());
-    accept_loop(listener, db).await
+    if aof_policy == Some(FsyncPolicy::EverySec) {
+        spawn_aof_flusher(db.clone());
+    }
+
+    let result = accept_loop(listener, db.clone()).await;
+
+    // Persist on a clean shutdown: a final snapshot, and a final AOF flush.
+    match db.save().await {
+        Ok(()) => info!("snapshot saved on shutdown"),
+        Err(cause) => warn!(%cause, "failed to save snapshot on shutdown"),
+    }
+    if let Err(cause) = db.sync_aof().await {
+        warn!(%cause, "failed to sync AOF on shutdown");
+    }
+    result
+}
+
+/// Builds the database with the configured persistence backend and recovers
+/// prior state: the AOF (replayed) when append-only mode is on, otherwise the
+/// snapshot (loaded). Returns the database and the AOF's fsync policy, if any.
+async fn init_persistence(
+    config: &Config,
+    snapshot_path: PathBuf,
+) -> Result<(Database, Option<FsyncPolicy>)> {
+    if config.appendonly {
+        let policy: FsyncPolicy = config
+            .appendfsync
+            .parse()
+            .map_err(|cause| Error::new(ErrorKind::InvalidInput, cause))?;
+        let aof_path = PathBuf::from(&config.aof_file);
+        let aof = Aof::open(&aof_path, policy).await?;
+        let db = Database::with_persistence(Some(snapshot_path), Some(aof));
+
+        match replay_aof(&aof_path, &db).await {
+            Ok(count) if count > 0 => {
+                info!(commands = count, path = %aof_path.display(), "replayed AOF")
+            }
+            Ok(_) => {}
+            Err(cause) => warn!(%cause, path = %aof_path.display(), "failed to replay AOF"),
+        }
+        Ok((db, Some(policy)))
+    } else {
+        let db = Database::with_persistence(Some(snapshot_path.clone()), None);
+        match db.load_from(&snapshot_path).await {
+            Ok(true) => info!(
+                path = %snapshot_path.display(),
+                keys = db.dbsize().await,
+                "loaded snapshot"
+            ),
+            Ok(false) => {}
+            Err(cause) => warn!(%cause, path = %snapshot_path.display(), "failed to load snapshot"),
+        }
+        Ok((db, None))
+    }
+}
+
+/// Replays every command in the AOF into `db`, suppressing re-logging while it
+/// runs. Returns the number of commands applied.
+async fn replay_aof(path: &std::path::Path, db: &Database) -> Result<u64> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(cause) if cause.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(cause) => return Err(cause),
+    };
+
+    let mut reader = BufReader::new(&bytes[..]);
+    db.begin_replay();
+    let mut count = 0;
+    while let Some(tokens) = read_request(&mut reader).await? {
+        let _ = command::dispatch(&tokens, db).await;
+        count += 1;
+    }
+    db.end_replay();
+    Ok(count)
+}
+
+/// Periodically flushes the AOF to disk (the `everysec` policy).
+fn spawn_aof_flusher(db: Database) {
+    spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.tick().await; // the first tick fires immediately; skip it
+        loop {
+            ticker.tick().await;
+            if let Err(cause) = db.sync_aof().await {
+                warn!(%cause, "AOF flush failed");
+            }
+        }
+    });
 }
 
 /// Periodically evicts expired keys in the background, complementing the lazy

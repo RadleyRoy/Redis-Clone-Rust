@@ -12,6 +12,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+use tokio::spawn;
+use tracing::warn;
+
 use crate::database::db::{Database, StoreError};
 use crate::resp;
 
@@ -146,6 +149,8 @@ pub enum Command {
     DbSize,
     FlushAll,
     Info,
+    Save,
+    BgSave,
     IncrBy {
         key: String,
         delta: i64,
@@ -440,6 +445,8 @@ impl Command {
             // `INFO [section]` — the optional section argument is accepted and
             // ignored; the full block is always returned.
             "INFO" => Command::Info,
+            "SAVE" => Command::Save,
+            "BGSAVE" => Command::BgSave,
             "INCR" => Command::IncrBy {
                 key: single_key(args, "INCR")?,
                 delta: 1,
@@ -557,6 +564,40 @@ impl Command {
         };
         Ok(command)
     }
+
+    /// Whether this command mutates the keyspace, and so should be appended to
+    /// the AOF once it succeeds. `SAVE`/`BGSAVE` are excluded: they persist
+    /// state without changing it.
+    fn is_write(&self) -> bool {
+        matches!(
+            self,
+            Command::Set { .. }
+                | Command::Del { .. }
+                | Command::LPush { .. }
+                | Command::RPush { .. }
+                | Command::LPop { .. }
+                | Command::RPop { .. }
+                | Command::SAdd { .. }
+                | Command::SRem { .. }
+                | Command::ZAdd { .. }
+                | Command::ZRem { .. }
+                | Command::HSet { .. }
+                | Command::HDel { .. }
+                | Command::HIncrBy { .. }
+                | Command::Expire { .. }
+                | Command::Persist { .. }
+                | Command::Rename { .. }
+                | Command::FlushAll
+                | Command::IncrBy { .. }
+                | Command::Append { .. }
+                | Command::MSet { .. }
+                | Command::SetNx { .. }
+                | Command::GetSet { .. }
+                | Command::LSet { .. }
+                | Command::SPop { .. }
+                | Command::ZIncrBy { .. }
+        )
+    }
 }
 
 /// Parses a tokenized request and executes it, returning the RESP reply. An
@@ -566,7 +607,15 @@ pub async fn dispatch(tokens: &[String], db: &Database) -> String {
         return String::new();
     }
     match Command::parse(tokens) {
-        Ok(command) => execute(command, db).await,
+        Ok(command) => {
+            let is_write = command.is_write();
+            let reply = execute(command, db).await;
+            // Append successful writes to the AOF; error replies start with '-'.
+            if is_write && !reply.starts_with('-') {
+                db.log_write(tokens).await;
+            }
+            reply
+        }
         Err(error) => resp::error(&error.to_string()),
     }
 }
@@ -659,6 +708,19 @@ async fn execute(command: Command, db: &Database) -> String {
             resp::simple_string("OK")
         }
         Command::Info => resp::bulk_string(&db.info().await),
+        Command::Save => match db.save().await {
+            Ok(()) => resp::simple_string("OK"),
+            Err(cause) => resp::error(&format!("ERR {cause}")),
+        },
+        Command::BgSave => {
+            let db = db.clone();
+            spawn(async move {
+                if let Err(cause) = db.save().await {
+                    warn!(%cause, "background save failed");
+                }
+            });
+            resp::simple_string("Background saving started")
+        }
         Command::IncrBy { key, delta } => reply_signed(db.incr_by(key, delta).await),
         Command::Append { key, value } => reply_count(db.append(key, &value).await),
         Command::StrLen { key } => reply_count(db.strlen(&key).await),

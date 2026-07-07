@@ -12,13 +12,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
+use tracing::warn;
 
+use crate::database::aof::Aof;
 use crate::database::data_structure::{RHash, RList, RSet, RSortedSet};
+use crate::database::snapshot::{SerValue, Snapshot, SnapshotEntry};
 
 /// Errors the store can return to a caller.
 #[derive(Debug, PartialEq, Eq)]
@@ -247,12 +252,23 @@ impl Stats {
     }
 }
 
+/// Persistence configuration shared across connections: where snapshots live,
+/// the optional append-only log, and a flag marking that commands are currently
+/// being replayed from that log (so they must not be re-appended to it).
+#[derive(Default)]
+struct Persistence {
+    snapshot_path: Option<PathBuf>,
+    aof: Option<Aof>,
+    replaying: AtomicBool,
+}
+
 /// A thread-safe, in-memory store. Cloning shares the same underlying data, so
 /// every connection task operates on one database.
 #[derive(Clone)]
 pub struct Database {
     store: Arc<RwLock<Store>>,
     stats: Arc<Stats>,
+    persistence: Arc<Persistence>,
 }
 
 impl Default for Database {
@@ -260,6 +276,7 @@ impl Default for Database {
         Self {
             store: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(Stats::new()),
+            persistence: Arc::new(Persistence::default()),
         }
     }
 }
@@ -267,6 +284,18 @@ impl Default for Database {
 impl Database {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Constructs a database with the given persistence backends: an optional
+    /// snapshot path and an optional append-only log.
+    pub fn with_persistence(snapshot_path: Option<PathBuf>, aof: Option<Aof>) -> Self {
+        let mut database = Self::new();
+        database.persistence = Arc::new(Persistence {
+            snapshot_path,
+            aof,
+            replaying: AtomicBool::new(false),
+        });
+        database
     }
 
     /// Reads the live entry for `key` under a shared read lock, passing it to
@@ -1018,6 +1047,155 @@ impl Database {
              keys:{keys}\r\n"
         )
     }
+
+    // --- Persistence ----------------------------------------------------
+
+    /// Builds a serializable snapshot of every live key, recording each TTL as
+    /// the number of seconds remaining.
+    pub async fn snapshot(&self) -> Snapshot {
+        let store = self.store.read().await;
+        let now = Instant::now();
+        let entries = store
+            .iter()
+            .filter(|(_, entry)| !entry.is_expired())
+            .map(|(key, entry)| {
+                let ttl_secs = entry
+                    .expires_at
+                    .map(|deadline| deadline.saturating_duration_since(now).as_secs());
+                let value = match &entry.value {
+                    Value::Str(value) => SerValue::Str(value.clone()),
+                    Value::List(list) => SerValue::List(list.lrange(0, -1)),
+                    Value::Set(set) => SerValue::Set(set.smembers()),
+                    Value::SortedSet(zset) => SerValue::ZSet(zset.zrange_with_scores(0, -1)),
+                    Value::Hash(hash) => SerValue::Hash(hash.hgetall()),
+                };
+                SnapshotEntry {
+                    key: key.clone(),
+                    ttl_secs,
+                    value,
+                }
+            })
+            .collect();
+        Snapshot { entries }
+    }
+
+    /// Replaces the entire keyspace with the contents of `snapshot`, turning
+    /// each stored remaining-seconds TTL back into a deadline.
+    pub async fn load_snapshot(&self, snapshot: Snapshot) {
+        let mut store = self.store.write().await;
+        store.clear();
+        for entry in snapshot.entries {
+            let value = match entry.value {
+                SerValue::Str(value) => Value::Str(value),
+                SerValue::List(items) => {
+                    let mut list = RList::new();
+                    for item in items {
+                        list.rpush(item);
+                    }
+                    Value::List(list)
+                }
+                SerValue::Set(items) => {
+                    let mut set = RSet::new();
+                    for item in items {
+                        set.sadd(item);
+                    }
+                    Value::Set(set)
+                }
+                SerValue::ZSet(items) => {
+                    let mut zset = RSortedSet::new();
+                    for (member, score) in items {
+                        zset.zadd(score, member);
+                    }
+                    Value::SortedSet(zset)
+                }
+                SerValue::Hash(items) => {
+                    let mut hash = RHash::new();
+                    for (field, value) in items {
+                        hash.hset(field, value);
+                    }
+                    Value::Hash(hash)
+                }
+            };
+            let expires_at = entry
+                .ttl_secs
+                .map(|secs| Instant::now() + Duration::from_secs(secs));
+            store.insert(entry.key, Entry { value, expires_at });
+        }
+    }
+
+    /// Writes a JSON snapshot to `path`, via a temporary file and rename so a
+    /// crash mid-write cannot corrupt an existing snapshot.
+    pub async fn save_to(&self, path: &Path) -> io::Result<()> {
+        let snapshot = self.snapshot().await;
+        let json = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
+        let temp = path.with_extension("tmp");
+        tokio::fs::write(&temp, json).await?;
+        tokio::fs::rename(&temp, path).await?;
+        Ok(())
+    }
+
+    /// Loads a snapshot from `path` if it exists. Returns `true` if a snapshot
+    /// was loaded, `false` if the file was simply absent.
+    pub async fn load_from(&self, path: &Path) -> io::Result<bool> {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => {
+                let snapshot: Snapshot =
+                    serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                self.load_snapshot(snapshot).await;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The configured snapshot path, if persistence is enabled.
+    pub fn snapshot_path(&self) -> Option<&Path> {
+        self.persistence.snapshot_path.as_deref()
+    }
+
+    /// Writes a snapshot to the configured path. A no-op (still `Ok`) when no
+    /// snapshot path is configured. Backs the `SAVE`/`BGSAVE` commands and the
+    /// save-on-shutdown path.
+    pub async fn save(&self) -> io::Result<()> {
+        match self.snapshot_path() {
+            Some(path) => self.save_to(path).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Appends a successfully executed write command to the AOF, if one is
+    /// configured. Skipped while replaying, so replayed commands are not logged
+    /// back to the file they came from.
+    pub async fn log_write(&self, tokens: &[String]) {
+        if self.persistence.replaying.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(aof) = &self.persistence.aof
+            && let Err(cause) = aof.append(tokens).await
+        {
+            warn!(%cause, "failed to append to AOF");
+        }
+    }
+
+    /// Marks the start of AOF replay, suppressing re-logging until
+    /// [`end_replay`](Self::end_replay).
+    pub fn begin_replay(&self) {
+        self.persistence.replaying.store(true, Ordering::Relaxed);
+    }
+
+    /// Marks the end of AOF replay.
+    pub fn end_replay(&self) {
+        self.persistence.replaying.store(false, Ordering::Relaxed);
+    }
+
+    /// Flushes the AOF to disk, if one is configured.
+    pub async fn sync_aof(&self) -> io::Result<()> {
+        match &self.persistence.aof {
+            Some(aof) => aof.sync().await,
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1071,6 +1249,46 @@ mod tests {
         assert_eq!(db.sweep_expired().await, 1);
         assert_eq!(db.dbsize().await, 1);
         assert_eq!(db.get("live").await.unwrap(), Some("v".to_string()));
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trips_every_type() {
+        let source = Database::new();
+        source.set("s".to_string(), "v".to_string(), None).await;
+        source
+            .rpush("l".to_string(), vec!["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        source
+            .sadd("set".to_string(), vec!["x".to_string()])
+            .await
+            .unwrap();
+        source
+            .zadd("z".to_string(), vec![(1.5, "m".to_string())])
+            .await
+            .unwrap();
+        source
+            .hset("h".to_string(), "f".to_string(), "1".to_string())
+            .await
+            .unwrap();
+
+        // Round-trip the snapshot into a fresh database.
+        let snapshot = source.snapshot().await;
+        let restored = Database::new();
+        restored.load_snapshot(snapshot).await;
+
+        assert_eq!(restored.get("s").await.unwrap(), Some("v".to_string()));
+        assert_eq!(
+            restored.lrange("l", 0, -1).await.unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(restored.sismember("set", "x").await.unwrap());
+        assert_eq!(restored.zscore("z", "m").await.unwrap(), Some(1.5));
+        assert_eq!(
+            restored.hget("h", "f").await.unwrap(),
+            Some("1".to_string())
+        );
+        assert_eq!(restored.dbsize().await, 5);
     }
 
     #[tokio::test]
