@@ -1,8 +1,10 @@
 name: Verify
 
-# Manually triggered from the GitHub web UI:
-#   Actions -> Verify -> Run workflow
+# Runs automatically on every push and pull request, and can also be
+# triggered manually from the GitHub web UI (Actions -> Verify -> Run workflow).
 on:
+  push:
+  pull_request:
   workflow_dispatch:
 
 # Read-only: this workflow verifies the code but never writes to the repo.

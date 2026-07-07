@@ -11,59 +11,211 @@
 //! logged without bringing the whole server down.
 
 use std::io::{Error, ErrorKind, Result};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::spawn;
+use tokio::sync::mpsc;
+use tokio::{select, signal, spawn};
+use tracing::{debug, info, warn};
 
 use crate::command;
+use crate::config::Config;
+use crate::database::aof::{Aof, FsyncPolicy};
 use crate::database::db::Database;
+use crate::session::Session;
 
 /// Largest number of arguments accepted in a single RESP array request.
 const MAX_MULTIBULK: usize = 1024 * 1024;
 /// Largest byte length accepted for a single RESP bulk-string argument.
 const MAX_BULK_BYTES: usize = 512 * 1024 * 1024;
 
-/// Binds to `address` and serves clients until the process is stopped. Returns
-/// an error only if the initial bind fails.
-pub async fn run(address: &str) -> Result<()> {
-    let listener = TcpListener::bind(address).await?;
-    eprintln!("Redis clone listening on {}", listener.local_addr()?);
-    accept_loop(listener).await
+/// Binds to the configured address and serves clients until interrupted with
+/// Ctrl+C. Returns an error only if the initial bind fails.
+pub async fn run(config: &Config) -> Result<()> {
+    let listener = TcpListener::bind(config.address()).await?;
+    info!(address = %listener.local_addr()?, "redis_clone listening");
+
+    let snapshot_path = PathBuf::from(&config.snapshot_file);
+    let (db, aof_policy) = init_persistence(config, snapshot_path).await?;
+
+    spawn_sweeper(db.clone(), config.sweep_interval());
+    if aof_policy == Some(FsyncPolicy::EverySec) {
+        spawn_aof_flusher(db.clone());
+    }
+
+    let result = accept_loop(listener, db.clone()).await;
+
+    // Persist on a clean shutdown: a final snapshot, and a final AOF flush.
+    match db.save().await {
+        Ok(()) => info!("snapshot saved on shutdown"),
+        Err(cause) => warn!(%cause, "failed to save snapshot on shutdown"),
+    }
+    if let Err(cause) = db.sync_aof().await {
+        warn!(%cause, "failed to sync AOF on shutdown");
+    }
+    result
 }
 
-/// Accepts connections forever, spawning a task to serve each one.
-async fn accept_loop(listener: TcpListener) -> Result<()> {
-    let db = Database::new();
+/// Builds the database with the configured persistence backend and recovers
+/// prior state: the AOF (replayed) when append-only mode is on, otherwise the
+/// snapshot (loaded). Returns the database and the AOF's fsync policy, if any.
+async fn init_persistence(
+    config: &Config,
+    snapshot_path: PathBuf,
+) -> Result<(Database, Option<FsyncPolicy>)> {
+    if config.appendonly {
+        let policy: FsyncPolicy = config
+            .appendfsync
+            .parse()
+            .map_err(|cause| Error::new(ErrorKind::InvalidInput, cause))?;
+        let aof_path = PathBuf::from(&config.aof_file);
+        let aof = Aof::open(&aof_path, policy).await?;
+        let db = Database::with_persistence(Some(snapshot_path), Some(aof));
+
+        match replay_aof(&aof_path, &db).await {
+            Ok(count) if count > 0 => {
+                info!(commands = count, path = %aof_path.display(), "replayed AOF")
+            }
+            Ok(_) => {}
+            Err(cause) => warn!(%cause, path = %aof_path.display(), "failed to replay AOF"),
+        }
+        Ok((db, Some(policy)))
+    } else {
+        let db = Database::with_persistence(Some(snapshot_path.clone()), None);
+        match db.load_from(&snapshot_path).await {
+            Ok(true) => info!(
+                path = %snapshot_path.display(),
+                keys = db.dbsize().await,
+                "loaded snapshot"
+            ),
+            Ok(false) => {}
+            Err(cause) => warn!(%cause, path = %snapshot_path.display(), "failed to load snapshot"),
+        }
+        Ok((db, None))
+    }
+}
+
+/// Replays every command in the AOF into `db`, suppressing re-logging while it
+/// runs. Returns the number of commands applied.
+async fn replay_aof(path: &std::path::Path, db: &Database) -> Result<u64> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(cause) if cause.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(cause) => return Err(cause),
+    };
+
+    let mut reader = BufReader::new(&bytes[..]);
+    db.begin_replay();
+    let mut count = 0;
+    while let Some(tokens) = read_request(&mut reader).await? {
+        let _ = command::dispatch(&tokens, db).await;
+        count += 1;
+    }
+    db.end_replay();
+    Ok(count)
+}
+
+/// Periodically flushes the AOF to disk (the `everysec` policy).
+fn spawn_aof_flusher(db: Database) {
+    spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.tick().await; // the first tick fires immediately; skip it
+        loop {
+            ticker.tick().await;
+            if let Err(cause) = db.sync_aof().await {
+                warn!(%cause, "AOF flush failed");
+            }
+        }
+    });
+}
+
+/// Periodically evicts expired keys in the background, complementing the lazy
+/// eviction that happens on access.
+fn spawn_sweeper(db: Database, interval: Duration) {
+    spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // the first tick fires immediately; skip it
+        loop {
+            ticker.tick().await;
+            let removed = db.sweep_expired().await;
+            if removed > 0 {
+                debug!(removed, "swept expired keys");
+            }
+        }
+    });
+}
+
+/// Accepts connections until Ctrl+C, spawning a task to serve each one. On the
+/// shutdown signal it stops accepting and returns; in-flight connection tasks
+/// are left to finish on their own.
+async fn accept_loop(listener: TcpListener, db: Database) -> Result<()> {
     loop {
-        let (socket, peer) = match listener.accept().await {
-            Ok(connection) => connection,
-            Err(error) => {
-                eprintln!("failed to accept connection: {error}");
-                continue;
+        let (socket, peer) = select! {
+            result = listener.accept() => match result {
+                Ok(connection) => connection,
+                Err(cause) => {
+                    warn!(%cause, "failed to accept connection");
+                    continue;
+                }
+            },
+            _ = signal::ctrl_c() => {
+                info!("shutdown signal received; no longer accepting connections");
+                return Ok(());
             }
         };
 
         let db = db.clone();
         spawn(async move {
-            if let Err(error) = handle_connection(socket, db).await {
-                eprintln!("connection {peer} ended: {error}");
+            let clients = db.client_connected();
+            debug!(%peer, clients, "client connected");
+            if let Err(cause) = handle_connection(socket, db.clone()).await {
+                debug!(%peer, %cause, "connection ended");
             }
+            db.client_disconnected();
         });
     }
 }
 
-/// Serves a single client: one request per iteration until the peer disconnects.
+/// Serves a single client until it disconnects.
+///
+/// Requests are read in a dedicated task and delivered over a channel, so the
+/// main loop can wait on *either* the next request *or* a pub/sub message
+/// without a message ever cancelling a half-finished read.
 async fn handle_connection(socket: TcpStream, db: Database) -> Result<()> {
     let (reader, mut writer) = socket.into_split();
-    let mut reader = BufReader::new(reader);
+    let (mut session, mut mailbox) = Session::new(db);
 
-    while let Some(tokens) = read_request(&mut reader).await? {
-        let response = command::dispatch(&tokens, &db).await;
-        if !response.is_empty() {
-            writer.write_all(response.as_bytes()).await?;
+    let (requests_tx, mut requests) = mpsc::channel::<Vec<String>>(16);
+    let reader_task = spawn(async move {
+        let mut reader = BufReader::new(reader);
+        while let Ok(Some(tokens)) = read_request(&mut reader).await {
+            if requests_tx.send(tokens).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        select! {
+            request = requests.recv() => match request {
+                Some(tokens) => {
+                    let reply = session.handle(&tokens).await;
+                    if !reply.is_empty() {
+                        writer.write_all(reply.as_bytes()).await?;
+                    }
+                }
+                None => break, // the reader task ended (EOF or protocol error)
+            },
+            Some(message) = mailbox.recv() => {
+                writer.write_all(message.as_bytes()).await?;
+            }
         }
     }
+
+    session.cleanup();
+    reader_task.abort();
     Ok(())
 }
 
@@ -150,7 +302,7 @@ mod tests {
     async fn start_server() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        spawn(accept_loop(listener));
+        spawn(accept_loop(listener, Database::new()));
         address
     }
 
@@ -188,5 +340,78 @@ mod tests {
     async fn multibulk_length_out_of_range_is_rejected() {
         let mut input = BufReader::new(&b"*99999999999999\r\n"[..]);
         assert!(read_request(&mut input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn transaction_queues_and_execs() {
+        let address = start_server().await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        writer.write_all(b"MULTI\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "+OK\r\n");
+        writer.write_all(b"SET k 1\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "+QUEUED\r\n");
+        writer.write_all(b"INCR k\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "+QUEUED\r\n");
+
+        // EXEC returns an array of each queued command's reply.
+        writer.write_all(b"EXEC\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "*2\r\n");
+        assert_eq!(next_line(&mut reader).await, "+OK\r\n");
+        assert_eq!(next_line(&mut reader).await, ":2\r\n");
+    }
+
+    #[tokio::test]
+    async fn exec_without_multi_is_an_error() {
+        let address = start_server().await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        writer.write_all(b"EXEC\r\n").await.unwrap();
+        assert!(
+            next_line(&mut reader)
+                .await
+                .starts_with("-ERR EXEC without MULTI")
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_a_subscriber() {
+        let address = start_server().await;
+
+        // Subscriber connection.
+        let sub = TcpStream::connect(address).await.unwrap();
+        let (sub_reader, mut sub_writer) = sub.into_split();
+        let mut sub_reader = BufReader::new(sub_reader);
+        sub_writer.write_all(b"SUBSCRIBE news\r\n").await.unwrap();
+        // Confirmation: *3 / $9 subscribe / $4 news / :1
+        assert_eq!(next_line(&mut sub_reader).await, "*3\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$9\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "subscribe\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$4\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "news\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, ":1\r\n");
+
+        // Publisher connection.
+        let pub_stream = TcpStream::connect(address).await.unwrap();
+        let (pub_reader, mut pub_writer) = pub_stream.into_split();
+        let mut pub_reader = BufReader::new(pub_reader);
+        pub_writer
+            .write_all(b"PUBLISH news hello\r\n")
+            .await
+            .unwrap();
+        assert_eq!(next_line(&mut pub_reader).await, ":1\r\n"); // one subscriber
+
+        // The subscriber receives the message: *3 / $7 message / $4 news / $5 hello
+        assert_eq!(next_line(&mut sub_reader).await, "*3\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$7\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "message\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$4\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "news\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "$5\r\n");
+        assert_eq!(next_line(&mut sub_reader).await, "hello\r\n");
     }
 }

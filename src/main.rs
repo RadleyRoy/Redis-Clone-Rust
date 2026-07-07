@@ -1,17 +1,35 @@
 mod command;
+mod config;
 mod database;
 mod resp;
 mod server;
+mod session;
 
+use std::str::FromStr;
+
+use clap::Parser;
+use tracing::{Level, error};
+
+use config::Config;
 use server::run;
-
-/// Address the server listens on. Kept here as the single place to change it.
-const LISTEN_ADDRESS: &str = "127.0.0.1:7335";
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run(LISTEN_ADDRESS).await {
-        eprintln!("fatal: could not start server on {LISTEN_ADDRESS}: {error}");
+    let config = Config::parse();
+    init_tracing(&config.log_level);
+
+    if let Err(cause) = run(&config).await {
+        error!(address = %config.address(), %cause, "failed to start server");
         std::process::exit(1);
     }
+}
+
+/// Installs the global tracing subscriber at the requested level, falling back
+/// to `INFO` if the level string is not recognised.
+fn init_tracing(level: &str) {
+    let level = Level::from_str(level).unwrap_or(Level::INFO);
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_target(false)
+        .init();
 }

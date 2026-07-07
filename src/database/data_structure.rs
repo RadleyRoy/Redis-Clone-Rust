@@ -30,6 +30,20 @@ fn resolve_range(start: i64, stop: i64, len: usize) -> Option<(usize, usize)> {
     Some((start as usize, stop as usize))
 }
 
+/// Translate a single Redis index (possibly negative) into a concrete in-bounds
+/// offset, or `None` if it falls outside the collection.
+fn normalize_index(index: i64, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let resolved = if index < 0 { index + len as i64 } else { index };
+    if (0..len as i64).contains(&resolved) {
+        Some(resolved as usize)
+    } else {
+        None
+    }
+}
+
 /// A Redis list, backed by a double-ended queue for O(1) pushes and pops at
 /// both ends.
 #[derive(Default)]
@@ -73,6 +87,24 @@ impl RList {
         }
     }
 
+    /// Returns the element at `index` (negative counts from the end), or `None`
+    /// if the index is out of range.
+    pub fn lindex(&self, index: i64) -> Option<String> {
+        normalize_index(index, self.list.len()).map(|index| self.list[index].clone())
+    }
+
+    /// Overwrites the element at `index`, returning `false` if the index is out
+    /// of range.
+    pub fn lset(&mut self, index: i64, value: String) -> bool {
+        match normalize_index(index, self.list.len()) {
+            Some(index) => {
+                self.list[index] = value;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.list.len()
     }
@@ -111,8 +143,75 @@ impl RSet {
         self.set.contains(value)
     }
 
+    pub fn scard(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Removes and returns an arbitrary member, or `None` if the set is empty.
+    pub fn spop(&mut self) -> Option<String> {
+        let member = self.set.iter().next().cloned()?;
+        self.set.remove(&member);
+        Some(member)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.set.is_empty()
+    }
+}
+
+/// A Redis hash: a map from string field to string value, stored under a single
+/// key.
+#[derive(Default)]
+pub struct RHash {
+    map: HashMap<String, String>,
+}
+
+impl RHash {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets `field` to `value`, returning `true` if the field is newly added
+    /// (rather than overwritten), matching `HSET`'s "number of new fields" reply.
+    pub fn hset(&mut self, field: String, value: String) -> bool {
+        self.map.insert(field, value).is_none()
+    }
+
+    pub fn hget(&self, field: &str) -> Option<&String> {
+        self.map.get(field)
+    }
+
+    /// Removes `field`, returning `true` if it was present.
+    pub fn hdel(&mut self, field: &str) -> bool {
+        self.map.remove(field).is_some()
+    }
+
+    /// Returns every (field, value) pair, in no particular order.
+    pub fn hgetall(&self) -> Vec<(String, String)> {
+        self.map
+            .iter()
+            .map(|(field, value)| (field.clone(), value.clone()))
+            .collect()
+    }
+
+    pub fn hkeys(&self) -> Vec<String> {
+        self.map.keys().cloned().collect()
+    }
+
+    pub fn hvals(&self) -> Vec<String> {
+        self.map.values().cloned().collect()
+    }
+
+    pub fn hlen(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn hexists(&self, field: &str) -> bool {
+        self.map.contains_key(field)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 
@@ -215,6 +314,69 @@ impl RSortedSet {
         self.members.get(member).map(|score| score.into_inner())
     }
 
+    pub fn zcard(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Returns the 0-based rank of `member` (ascending by score), or `None` if
+    /// it is not present.
+    pub fn zrank(&self, member: &str) -> Option<usize> {
+        self.sorted.iter().position(|entry| entry.member == member)
+    }
+
+    /// Adds `increment` to `member`'s score (treating a missing member as 0),
+    /// returning the new score.
+    pub fn zincrby(&mut self, increment: f64, member: String) -> f64 {
+        let new_score = self.zscore(&member).unwrap_or(0.0) + increment;
+        self.zadd(new_score, member);
+        new_score
+    }
+
+    /// Like [`zrange`](Self::zrange) but returns each member paired with its
+    /// score, for the `WITHSCORES` option.
+    pub fn zrange_with_scores(&self, start: i64, stop: i64) -> Vec<(String, f64)> {
+        match resolve_range(start, stop, self.sorted.len()) {
+            Some((start, stop)) => self
+                .sorted
+                .iter()
+                .skip(start)
+                .take(stop - start + 1)
+                .map(|entry| (entry.member.clone(), entry.score.into_inner()))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns members whose score falls within the given bounds (ascending by
+    /// score). Each bound carries an `inclusive` flag, supporting Redis'
+    /// exclusive `(` syntax and `+inf`/`-inf`.
+    pub fn zrange_by_score(
+        &self,
+        min: f64,
+        min_inclusive: bool,
+        max: f64,
+        max_inclusive: bool,
+    ) -> Vec<String> {
+        self.sorted
+            .iter()
+            .filter(|entry| {
+                let score = entry.score.into_inner();
+                let above_min = if min_inclusive {
+                    score >= min
+                } else {
+                    score > min
+                };
+                let below_max = if max_inclusive {
+                    score <= max
+                } else {
+                    score < max
+                };
+                above_min && below_max
+            })
+            .map(|entry| entry.member.clone())
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
     }
@@ -249,6 +411,19 @@ mod tests {
         assert!(set.sismember("x"));
         assert!(set.srem("x"));
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn hash_set_get_and_remove() {
+        let mut hash = RHash::new();
+        assert!(hash.hset("f".to_string(), "1".to_string())); // newly added
+        assert!(!hash.hset("f".to_string(), "2".to_string())); // overwritten
+        assert_eq!(hash.hget("f"), Some(&"2".to_string()));
+        assert!(hash.hexists("f"));
+        assert_eq!(hash.hlen(), 1);
+        assert!(hash.hdel("f"));
+        assert!(!hash.hdel("f"));
+        assert!(hash.is_empty());
     }
 
     #[test]

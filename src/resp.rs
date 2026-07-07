@@ -42,6 +42,20 @@ pub fn array(items: &[String]) -> String {
     out
 }
 
+/// An array of optional bulk strings, encoding each `None` as a null bulk
+/// string. This is the shape `MGET` returns: one reply element per requested
+/// key, with missing keys represented as nil rather than skipped.
+pub fn nullable_array(items: &[Option<String>]) -> String {
+    let mut out = format!("*{}\r\n", items.len());
+    for item in items {
+        match item {
+            Some(value) => out.push_str(&bulk_string(value)),
+            None => out.push_str(&null()),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +77,14 @@ mod tests {
             "*2\r\n$1\r\na\r\n$2\r\nbb\r\n"
         );
         assert_eq!(array(&[]), "*0\r\n");
+    }
+
+    #[test]
+    fn encodes_nullable_arrays() {
+        assert_eq!(
+            nullable_array(&[Some("a".to_string()), None, Some("c".to_string())]),
+            "*3\r\n$1\r\na\r\n$-1\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(nullable_array(&[]), "*0\r\n");
     }
 }
