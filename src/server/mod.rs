@@ -109,9 +109,22 @@ async fn replay_aof(path: &std::path::Path, db: &Database) -> Result<u64> {
     let mut reader = BufReader::new(&bytes[..]);
     db.begin_replay();
     let mut count = 0;
-    while let Some(tokens) = read_request(&mut reader).await? {
-        let _ = command::dispatch(&tokens, db).await;
-        count += 1;
+    // Drive the loop by hand rather than with `?` so a malformed trailing entry
+    // (a write interrupted by a crash) does not skip `end_replay`: that would
+    // leave the replay flag stuck on and silently drop every future AOF append.
+    // A truncated tail is tolerated, as Redis does, by stopping replay there.
+    loop {
+        match read_request(&mut reader).await {
+            Ok(Some(tokens)) => {
+                let _ = command::dispatch(&tokens, db).await;
+                count += 1;
+            }
+            Ok(None) => break,
+            Err(cause) => {
+                warn!(%cause, "stopped AOF replay at a malformed entry");
+                break;
+            }
+        }
     }
     db.end_replay();
     Ok(count)
@@ -197,26 +210,33 @@ async fn handle_connection(socket: TcpStream, db: Database) -> Result<()> {
         }
     });
 
-    loop {
+    // A write error must not skip cleanup: it ends the loop with the error
+    // instead of returning early, so the session's pub/sub subscriptions are
+    // always torn down and the reader task is always aborted.
+    let result = loop {
         select! {
             request = requests.recv() => match request {
                 Some(tokens) => {
                     let reply = session.handle(&tokens).await;
-                    if !reply.is_empty() {
-                        writer.write_all(reply.as_bytes()).await?;
+                    if !reply.is_empty()
+                        && let Err(cause) = writer.write_all(reply.as_bytes()).await
+                    {
+                        break Err(cause);
                     }
                 }
-                None => break, // the reader task ended (EOF or protocol error)
+                None => break Ok(()), // the reader task ended (EOF or protocol error)
             },
             Some(message) = mailbox.recv() => {
-                writer.write_all(message.as_bytes()).await?;
+                if let Err(cause) = writer.write_all(message.as_bytes()).await {
+                    break Err(cause);
+                }
             }
         }
-    }
+    };
 
     session.cleanup();
     reader_task.abort();
-    Ok(())
+    result
 }
 
 /// Reads one request as a list of tokens, choosing the framing from the first
@@ -313,6 +333,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_aof_replay_still_allows_future_writes_to_be_logged() {
+        // A valid `SET k1 v1` followed by an entry truncated mid-bulk-string,
+        // as a crash during an append would leave behind.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("redis_clone_replay_{unique}.aof"));
+        std::fs::write(
+            &path,
+            b"*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n*3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$5\r\nval",
+        )
+        .unwrap();
+
+        let aof = Aof::open(&path, FsyncPolicy::Always).await.unwrap();
+        let db = Database::with_persistence(None, Some(aof));
+        replay_aof(&path, &db).await.unwrap();
+
+        // The valid entry was applied, and replay stopped at the truncation.
+        assert_eq!(db.get("k1").await.unwrap(), Some("v1".to_string()));
+
+        // The replay flag must have been cleared despite the error, so a new
+        // write is still appended to the AOF (the bug left it stuck on).
+        db.log_write(&["SET".to_string(), "k3".to_string(), "v3".to_string()])
+            .await;
+        db.sync_aof().await.unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("k3"),
+            "new write was not logged: {contents:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn serves_inline_and_resp_requests_over_tcp() {
         let address = start_server().await;
         let stream = TcpStream::connect(address).await.unwrap();
@@ -361,6 +417,43 @@ mod tests {
         assert_eq!(next_line(&mut reader).await, "*2\r\n");
         assert_eq!(next_line(&mut reader).await, "+OK\r\n");
         assert_eq!(next_line(&mut reader).await, ":2\r\n");
+    }
+
+    #[tokio::test]
+    async fn subscribe_inside_multi_aborts_the_transaction() {
+        let address = start_server().await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        writer.write_all(b"MULTI\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "+OK\r\n");
+        writer.write_all(b"SET a 1\r\n").await.unwrap();
+        assert_eq!(next_line(&mut reader).await, "+QUEUED\r\n");
+        // SUBSCRIBE cannot be queued; it is rejected and dirties the transaction.
+        writer.write_all(b"SUBSCRIBE ch\r\n").await.unwrap();
+        assert!(next_line(&mut reader).await.starts_with("-ERR"));
+        // EXEC therefore aborts rather than half-applying the queue.
+        writer.write_all(b"EXEC\r\n").await.unwrap();
+        assert!(next_line(&mut reader).await.starts_with("-EXECABORT"));
+    }
+
+    #[tokio::test]
+    async fn multi_is_rejected_while_subscribed() {
+        let address = start_server().await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+
+        writer.write_all(b"SUBSCRIBE ch\r\n").await.unwrap();
+        // Drain the subscribe confirmation: *3 / $9 subscribe / $2 ch / :1.
+        assert_eq!(next_line(&mut reader).await, "*3\r\n");
+        for _ in 0..5 {
+            next_line(&mut reader).await;
+        }
+        // MULTI is not one of the commands allowed in subscribe mode.
+        writer.write_all(b"MULTI\r\n").await.unwrap();
+        assert!(next_line(&mut reader).await.starts_with("-ERR"));
     }
 
     #[tokio::test]

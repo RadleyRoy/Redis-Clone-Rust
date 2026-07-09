@@ -59,30 +59,44 @@ impl Session {
 
     /// Handles one request, returning the RESP reply (which may be empty, e.g.
     /// for a blank line).
+    ///
+    /// Subscribe mode and an open transaction are mutually exclusive: entering
+    /// subscribe mode is refused while a `MULTI` is open, and `MULTI` is one of
+    /// the commands the subscribe-mode guard rejects. That keeps the two state
+    /// machines from interleaving into a half-applied transaction.
     pub async fn handle(&mut self, tokens: &[String]) -> String {
         let Some(name) = tokens.first() else {
             return String::new();
         };
         let name = name.to_ascii_uppercase();
+
+        // While subscribed, RESP2 permits only (UN)SUBSCRIBE and PING; this
+        // guard runs first, so MULTI/EXEC/DISCARD are rejected here too.
+        if self.is_subscribed() && !matches!(name.as_str(), "SUBSCRIBE" | "UNSUBSCRIBE" | "PING") {
+            return resp::error(&format!(
+                "ERR Can't execute '{}': only (UN)SUBSCRIBE / PING are allowed in subscribe mode",
+                name.to_ascii_lowercase()
+            ));
+        }
+
         match name.as_str() {
             "MULTI" => return self.begin_multi(),
             "EXEC" => return self.exec().await,
             "DISCARD" => return self.discard(),
-            "SUBSCRIBE" => return self.subscribe(&tokens[1..]),
-            "UNSUBSCRIBE" => return self.unsubscribe(&tokens[1..]),
-            // While subscribed, RESP2 only permits a handful of commands.
-            other if self.is_subscribed() && other != "PING" => {
-                return resp::error(&format!(
-                    "ERR Can't execute '{}': only (UN)SUBSCRIBE / PING are allowed in subscribe mode",
-                    other.to_ascii_lowercase()
-                ));
-            }
             _ => {}
         }
 
-        // Inside a transaction, validate and queue; otherwise run immediately.
-        match self.transaction.as_mut() {
-            Some(transaction) => match Command::parse(tokens) {
+        // Inside a transaction, queue commands after validating they parse.
+        if let Some(transaction) = self.transaction.as_mut() {
+            // (UN)SUBSCRIBE are connection-mode commands, not keyspace commands,
+            // and cannot be queued (EXEC dispatches through the command layer,
+            // which does not know them). Redis forbids them in a transaction;
+            // reject and mark it dirty so EXEC aborts.
+            if matches!(name.as_str(), "SUBSCRIBE" | "UNSUBSCRIBE") {
+                transaction.dirty = true;
+                return resp::error(&format!("ERR {name} is not allowed in transactions"));
+            }
+            return match Command::parse(tokens) {
                 Ok(_) => {
                     transaction.commands.push(tokens.to_vec());
                     resp::simple_string("QUEUED")
@@ -91,8 +105,15 @@ impl Session {
                     transaction.dirty = true;
                     resp::error(&error.to_string())
                 }
-            },
-            None => command::dispatch(tokens, &self.db).await,
+            };
+        }
+
+        // Not in a transaction: (UN)SUBSCRIBE act immediately, everything else
+        // dispatches.
+        match name.as_str() {
+            "SUBSCRIBE" => self.subscribe(&tokens[1..]),
+            "UNSUBSCRIBE" => self.unsubscribe(&tokens[1..]),
+            _ => command::dispatch(tokens, &self.db).await,
         }
     }
 

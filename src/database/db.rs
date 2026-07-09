@@ -43,6 +43,9 @@ pub enum StoreError {
     NoSuchKey,
     /// A list index was out of range (`LSET`).
     IndexOutOfRange,
+    /// A sorted-set operation (`ZINCRBY`) would produce a `NaN` score, e.g.
+    /// incrementing `+inf` by `-inf`.
+    ScoreNaN,
 }
 
 impl fmt::Display for StoreError {
@@ -56,6 +59,7 @@ impl fmt::Display for StoreError {
             StoreError::Overflow => f.write_str("ERR increment or decrement would overflow"),
             StoreError::NoSuchKey => f.write_str("ERR no such key"),
             StoreError::IndexOutOfRange => f.write_str("ERR index out of range"),
+            StoreError::ScoreNaN => f.write_str("ERR resulting score is not a number (NaN)"),
         }
     }
 }
@@ -79,6 +83,16 @@ impl Entry {
     fn is_expired(&self) -> bool {
         matches!(self.expires_at, Some(deadline) if Instant::now() >= deadline)
     }
+}
+
+/// Turns a relative number of seconds into an absolute expiry deadline.
+///
+/// `Instant + Duration` panics on overflow, and `seconds` can come straight
+/// from a client (`SET k v EX <huge>`, `EXPIRE k <huge>`) or a snapshot file.
+/// An addition that would overflow the clock yields `None` — treated as "no
+/// expiry" — rather than crashing the connection task.
+fn deadline_after(seconds: u64) -> Option<Instant> {
+    Instant::now().checked_add(Duration::from_secs(seconds))
 }
 
 type Store = HashMap<String, Entry>;
@@ -326,7 +340,7 @@ impl Database {
 
     pub async fn set(&self, key: String, value: String, ttl: Option<u64>) {
         let mut store = self.store.write().await;
-        let expires_at = ttl.map(|seconds| Instant::now() + Duration::from_secs(seconds));
+        let expires_at = ttl.and_then(deadline_after);
         store.insert(
             key,
             Entry {
@@ -344,23 +358,17 @@ impl Database {
         .await
     }
 
-    /// Deletes `key` regardless of the type it holds. Returns `true` if a live
-    /// key was removed.
-    pub async fn delete(&self, key: &str) -> bool {
-        let mut store = self.store.write().await;
-        // Treat an already-expired key as "not present".
-        if live_entry(&mut store, key).is_none() {
-            return false;
-        }
-        store.remove(key).is_some()
-    }
-
     /// Deletes each of `keys`, returning how many live keys were removed. Backs
-    /// the variadic `DEL key [key ...]`.
+    /// the variadic `DEL key [key ...]`. Takes the write lock once for the whole
+    /// batch, so the multi-key delete is atomic with respect to other commands.
     pub async fn del(&self, keys: &[String]) -> usize {
+        let mut store = self.store.write().await;
         let mut removed = 0;
         for key in keys {
-            if self.delete(key).await {
+            // `live_entry` evicts an expired key and reports it absent, so only
+            // genuinely live keys are counted.
+            if live_entry(&mut store, key).is_some() {
+                store.remove(key);
                 removed += 1;
             }
         }
@@ -778,7 +786,14 @@ impl Database {
         member: String,
     ) -> Result<f64, StoreError> {
         let mut store = self.store.write().await;
-        Ok(sorted_set_or_create(&mut store, key)?.zincrby(increment, member))
+        let zset = sorted_set_or_create(&mut store, key)?;
+        let new_score = zset.zscore(&member).unwrap_or(0.0) + increment;
+        // `+inf + -inf` is NaN, which Redis rejects rather than storing.
+        if new_score.is_nan() {
+            return Err(StoreError::ScoreNaN);
+        }
+        zset.zadd(new_score, member);
+        Ok(new_score)
     }
 
     pub async fn zrange_with_scores(
@@ -956,7 +971,7 @@ impl Database {
         if seconds <= 0 {
             store.remove(key);
         } else if let Some(entry) = store.get_mut(key) {
-            entry.expires_at = Some(Instant::now() + Duration::from_secs(seconds as u64));
+            entry.expires_at = deadline_after(seconds as u64);
         }
         true
     }
@@ -1093,7 +1108,12 @@ impl Database {
                     Value::Str(value) => SerValue::Str(value.clone()),
                     Value::List(list) => SerValue::List(list.lrange(0, -1)),
                     Value::Set(set) => SerValue::Set(set.smembers()),
-                    Value::SortedSet(zset) => SerValue::ZSet(zset.zrange_with_scores(0, -1)),
+                    Value::SortedSet(zset) => SerValue::ZSet(
+                        zset.zrange_with_scores(0, -1)
+                            .into_iter()
+                            .map(|(member, score)| (member, score.to_string()))
+                            .collect(),
+                    ),
                     Value::Hash(hash) => SerValue::Hash(hash.hgetall()),
                 };
                 SnapshotEntry {
@@ -1131,7 +1151,10 @@ impl Database {
                 SerValue::ZSet(items) => {
                     let mut zset = RSortedSet::new();
                     for (member, score) in items {
-                        zset.zadd(score, member);
+                        // Scores are stored as strings (see `SerValue`); a value
+                        // we wrote always parses, but fall back rather than fail
+                        // the whole load if the file was edited by hand.
+                        zset.zadd(score.parse::<f64>().unwrap_or(0.0), member);
                     }
                     Value::SortedSet(zset)
                 }
@@ -1143,9 +1166,7 @@ impl Database {
                     Value::Hash(hash)
                 }
             };
-            let expires_at = entry
-                .ttl_secs
-                .map(|secs| Instant::now() + Duration::from_secs(secs));
+            let expires_at = entry.ttl_secs.and_then(deadline_after);
             store.insert(entry.key, Entry { value, expires_at });
         }
     }
@@ -1153,9 +1174,15 @@ impl Database {
     /// Writes a JSON snapshot to `path`, via a temporary file and rename so a
     /// crash mid-write cannot corrupt an existing snapshot.
     pub async fn save_to(&self, path: &Path) -> io::Result<()> {
+        static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
         let snapshot = self.snapshot().await;
         let json = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
-        let temp = path.with_extension("tmp");
+        // A per-write temp name (not a fixed `.tmp`): two concurrent saves — say
+        // an overlapping SAVE and BGSAVE — must not write the same temp file and
+        // rename each other's half-written JSON into place.
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_extension(format!("tmp.{}.{unique}", std::process::id()));
         tokio::fs::write(&temp, json).await?;
         tokio::fs::rename(&temp, path).await?;
         Ok(())
@@ -1234,8 +1261,8 @@ mod tests {
         let db = Database::new();
         db.set("k".to_string(), "v".to_string(), None).await;
         assert_eq!(db.get("k").await.unwrap(), Some("v".to_string()));
-        assert!(db.delete("k").await);
-        assert!(!db.delete("k").await);
+        assert_eq!(db.del(&["k".to_string()]).await, 1);
+        assert_eq!(db.del(&["k".to_string()]).await, 0);
         assert_eq!(db.get("k").await.unwrap(), None);
     }
 
@@ -1245,7 +1272,7 @@ mod tests {
         db.rpush("list".to_string(), vec!["a".to_string()])
             .await
             .unwrap();
-        assert!(db.delete("list").await);
+        assert_eq!(db.del(&["list".to_string()]).await, 1);
         assert_eq!(
             db.lrange("list", 0, -1).await.unwrap(),
             Vec::<String>::new()
@@ -1266,6 +1293,66 @@ mod tests {
         let db = Database::new();
         db.set("k".to_string(), "v".to_string(), Some(0)).await;
         assert_eq!(db.get("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn huge_ttl_does_not_panic() {
+        let db = Database::new();
+        // A TTL that would overflow `Instant + Duration` must not crash the
+        // task; it is treated as "no expiry" instead.
+        db.set("k".to_string(), "v".to_string(), Some(u64::MAX))
+            .await;
+        assert_eq!(db.get("k").await.unwrap(), Some("v".to_string()));
+        assert_eq!(db.ttl("k").await, -1);
+        assert!(db.expire("k", i64::MAX).await);
+        assert_eq!(db.get("k").await.unwrap(), Some("v".to_string()));
+    }
+
+    #[tokio::test]
+    async fn zincrby_to_nan_is_rejected() {
+        let db = Database::new();
+        db.zadd("z".to_string(), vec![(f64::INFINITY, "m".to_string())])
+            .await
+            .unwrap();
+        // +inf + -inf = NaN, which Redis refuses to store.
+        assert_eq!(
+            db.zincrby("z".to_string(), f64::NEG_INFINITY, "m".to_string())
+                .await,
+            Err(StoreError::ScoreNaN)
+        );
+        // The original score is untouched.
+        assert_eq!(db.zscore("z", "m").await.unwrap(), Some(f64::INFINITY));
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trips_non_finite_scores() {
+        let source = Database::new();
+        source
+            .zadd(
+                "z".to_string(),
+                vec![
+                    (f64::INFINITY, "hi".to_string()),
+                    (f64::NEG_INFINITY, "lo".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Go through the real JSON path: a non-finite score used to serialize as
+        // `null` and make the whole snapshot unloadable.
+        let json = serde_json::to_vec(&source.snapshot().await).unwrap();
+        let snapshot: Snapshot = serde_json::from_slice(&json).unwrap();
+        let restored = Database::new();
+        restored.load_snapshot(snapshot).await;
+
+        assert_eq!(
+            restored.zscore("z", "hi").await.unwrap(),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(
+            restored.zscore("z", "lo").await.unwrap(),
+            Some(f64::NEG_INFINITY)
+        );
     }
 
     #[tokio::test]
