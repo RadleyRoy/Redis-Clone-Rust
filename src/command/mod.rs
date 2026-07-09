@@ -331,7 +331,7 @@ impl Command {
                 [key, rest @ ..] if !rest.is_empty() && rest.len() % 2 == 0 => {
                     let mut members = Vec::with_capacity(rest.len() / 2);
                     for pair in rest.chunks_exact(2) {
-                        let score = parse_number(&pair[0], CommandError::NotAFloat)?;
+                        let score = parse_score(&pair[0])?;
                         members.push((score, pair[1].clone()));
                     }
                     Command::ZAdd {
@@ -549,7 +549,7 @@ impl Command {
             "ZINCRBY" => match args {
                 [key, increment, member] => Command::ZIncrBy {
                     key: key.clone(),
-                    increment: parse_number(increment, CommandError::NotAFloat)?,
+                    increment: parse_score(increment)?,
                     member: member.clone(),
                 },
                 _ => return Err(arity("ZINCRBY")),
@@ -602,7 +602,6 @@ impl Command {
                 | Command::SetNx { .. }
                 | Command::GetSet { .. }
                 | Command::LSet { .. }
-                | Command::SPop { .. }
                 | Command::ZIncrBy { .. }
         )
     }
@@ -616,6 +615,18 @@ pub async fn dispatch(tokens: &[String], db: &Database) -> String {
     }
     match Command::parse(tokens) {
         Ok(command) => {
+            // SPOP removes an *arbitrary* member, so logging it verbatim would
+            // replay to a different member on restart, diverging from the
+            // persisted state. Log the equivalent `SREM` of the member actually
+            // removed instead — the same rewrite Redis applies.
+            if let Command::SPop { key } = command {
+                let popped = db.spop(&key).await;
+                if let Ok(Some(member)) = &popped {
+                    db.log_write(&[String::from("SREM"), key, member.clone()])
+                        .await;
+                }
+                return reply_optional(popped);
+            }
             let is_write = command.is_write();
             let reply = execute(command, db).await;
             // Append successful writes to the AOF; error replies start with '-'.
@@ -874,6 +885,19 @@ fn parse_number<T: FromStr>(
     raw.parse::<T>().map_err(|_| to_error(raw.to_string()))
 }
 
+/// Parses a sorted-set score. `f64::from_str` accepts `"nan"`, which Redis
+/// rejects (a `NaN` score has no meaningful order), so it is refused here;
+/// `inf`/`-inf` are allowed, as Redis allows.
+fn parse_score(raw: &str) -> Result<f64, CommandError> {
+    let score: f64 = raw
+        .parse()
+        .map_err(|_| CommandError::NotAFloat(raw.to_string()))?;
+    if score.is_nan() {
+        return Err(CommandError::NotAFloat(raw.to_string()));
+    }
+    Ok(score)
+}
+
 /// Negates a `DECRBY` amount, guarding against the one value (`i64::MIN`) whose
 /// negation overflows.
 fn negate(value: i64) -> Result<i64, CommandError> {
@@ -892,9 +916,15 @@ fn parse_score_bound(raw: &str) -> Result<(f64, bool), CommandError> {
     let score = match number.to_ascii_lowercase().as_str() {
         "+inf" | "inf" => f64::INFINITY,
         "-inf" => f64::NEG_INFINITY,
-        other => other
-            .parse::<f64>()
-            .map_err(|_| CommandError::NotAFloat(raw.to_string()))?,
+        other => {
+            let score: f64 = other
+                .parse()
+                .map_err(|_| CommandError::NotAFloat(raw.to_string()))?;
+            if score.is_nan() {
+                return Err(CommandError::NotAFloat(raw.to_string()));
+            }
+            score
+        }
     };
     Ok((score, inclusive))
 }
@@ -902,6 +932,49 @@ fn parse_score_bound(raw: &str) -> Result<(f64, bool), CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::database::aof::{Aof, FsyncPolicy};
+
+    /// A scratch file path that is removed when it goes out of scope, so AOF
+    /// tests do not leave files behind or collide with one another.
+    struct TempPath(std::path::PathBuf);
+
+    impl TempPath {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("redis_clone_test_{tag}_{unique}.aof"));
+            Self(path)
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn spop_is_logged_to_the_aof_as_a_deterministic_srem() {
+        let temp = TempPath::new("spop");
+        let aof = Aof::open(&temp.0, FsyncPolicy::Always).await.unwrap();
+        let db = Database::with_persistence(None, Some(aof));
+
+        handle("SADD s a b c", &db).await;
+        let popped = handle("SPOP s", &db).await;
+        // Reply is the popped member as a bulk string, e.g. "$1\r\na\r\n".
+        let member = popped.lines().nth(1).unwrap().to_string();
+
+        db.sync_aof().await.unwrap();
+        let logged = std::fs::read_to_string(&temp.0).unwrap();
+        // The AOF must record the equivalent SREM of the member actually
+        // removed, never the non-deterministic SPOP.
+        assert!(!logged.contains("SPOP"), "AOF logged raw SPOP: {logged:?}");
+        assert!(logged.contains("SREM"), "AOF missing SREM: {logged:?}");
+        assert!(logged.contains(&member), "AOF missing member: {logged:?}");
+    }
 
     #[tokio::test]
     async fn set_and_get_roundtrip() {
@@ -1049,6 +1122,30 @@ mod tests {
             handle("ZRANGEBYSCORE z 2 5", &db).await,
             "*1\r\n$1\r\nb\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn spop_removes_and_returns_a_member() {
+        let db = Database::new();
+        handle("SADD s only", &db).await;
+        assert_eq!(handle("SPOP s", &db).await, "$4\r\nonly\r\n");
+        // The set is now empty and the key is dropped.
+        assert_eq!(handle("SPOP s", &db).await, "$-1\r\n");
+        assert_eq!(handle("EXISTS s", &db).await, ":0\r\n");
+    }
+
+    #[tokio::test]
+    async fn nan_scores_are_rejected() {
+        let db = Database::new();
+        assert!(handle("ZADD z nan m", &db).await.starts_with("-ERR"));
+        assert!(handle("ZINCRBY z nan m", &db).await.starts_with("-ERR"));
+        assert!(
+            handle("ZRANGEBYSCORE z nan 5", &db)
+                .await
+                .starts_with("-ERR")
+        );
+        // inf remains valid, as in Redis.
+        assert_eq!(handle("ZADD z inf m", &db).await, ":1\r\n");
     }
 
     #[tokio::test]

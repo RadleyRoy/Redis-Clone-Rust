@@ -25,11 +25,17 @@ pub struct SnapshotEntry {
 }
 
 /// A serializable view of a stored value.
+///
+/// Sorted-set scores are stored as their string form rather than as JSON
+/// numbers: `serde_json` cannot represent a non-finite `f64` and silently
+/// serializes `inf`/`-inf`/`NaN` as `null`, which then fails to deserialize —
+/// a single such score would make the entire snapshot unloadable. The string
+/// form round-trips every `f64` exactly.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SerValue {
     Str(String),
     List(Vec<String>),
     Set(Vec<String>),
-    ZSet(Vec<(String, f64)>),
+    ZSet(Vec<(String, String)>),
     Hash(Vec<(String, String)>),
 }

@@ -389,5 +389,6 @@ This is a learning project, not a drop-in Redis replacement:
 - Only the commands above are implemented (no scripting, streams, or bitmaps).
 - Requests are parsed as RESP arrays or inline commands, but replies are always RESP2; there is no RESP3, and inline values cannot contain spaces (use `redis-cli`).
 - Snapshots are JSON (not the real Redis binary RDB format), and the AOF is never rewritten/compacted, so it grows without bound.
+- The AOF logs TTL commands with their original *relative* seconds (`SET k v EX 60`, `EXPIRE k 60`), so replay re-bases the expiry at restart time; a key can outlive its intended deadline across a restart. (Snapshots store remaining seconds and do not have this issue.)
 - Transactions run their queued commands in order but are not isolated from other connections (no `WATCH`), and there is a single database (no `SELECT`).
 - No pattern subscriptions (`PSUBSCRIBE`), replication, or clustering.

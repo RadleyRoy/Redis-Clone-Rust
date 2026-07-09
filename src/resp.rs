@@ -13,8 +13,21 @@ pub fn simple_string(value: &str) -> String {
 
 /// A `-<message>\r\n` error. The message is expected to already carry its
 /// error code, e.g. `"ERR unknown command"` or `"WRONGTYPE ..."`.
+///
+/// Error text is line-framed (no length prefix), and some messages embed a
+/// client-supplied token (an unknown command name, an unparsable number). A
+/// raw `\r` or `\n` in that token would forge a reply boundary and desynchronise
+/// a pipelining client, so any is replaced with a space before framing.
 pub fn error(message: &str) -> String {
-    format!("-{message}\r\n")
+    if message.contains(['\r', '\n']) {
+        let sanitized: String = message
+            .chars()
+            .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+            .collect();
+        format!("-{sanitized}\r\n")
+    } else {
+        format!("-{message}\r\n")
+    }
 }
 
 /// A `:<value>\r\n` integer reply.
@@ -59,6 +72,15 @@ pub fn nullable_array(items: &[Option<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_sanitizes_embedded_crlf() {
+        // A user token carrying CRLF must not split the reply into extra frames.
+        assert_eq!(
+            error("ERR unknown command 'X\r\n+OK'"),
+            "-ERR unknown command 'X  +OK'\r\n"
+        );
+    }
 
     #[test]
     fn encodes_scalar_replies() {

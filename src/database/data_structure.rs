@@ -324,14 +324,6 @@ impl RSortedSet {
         self.sorted.iter().position(|entry| entry.member == member)
     }
 
-    /// Adds `increment` to `member`'s score (treating a missing member as 0),
-    /// returning the new score.
-    pub fn zincrby(&mut self, increment: f64, member: String) -> f64 {
-        let new_score = self.zscore(&member).unwrap_or(0.0) + increment;
-        self.zadd(new_score, member);
-        new_score
-    }
-
     /// Like [`zrange`](Self::zrange) but returns each member paired with its
     /// score, for the `WITHSCORES` option.
     pub fn zrange_with_scores(&self, start: i64, stop: i64) -> Vec<(String, f64)> {
